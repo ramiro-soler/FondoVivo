@@ -44,9 +44,8 @@ Misma PC (RTX 3060, Ryzen 7 5800X, Windows 11 26H2, un monitor 2560×1440 a 200 
 | Consumo de la placa (sin fondo: 18 W) | **18,7 W** | 41,1 W |
 | RAM (working set) | **51 MB**, 1 proceso | 552 MB, 5 procesos |
 | CPU | 0,5 % | 0,65 % |
-| Íconos del escritorio | Visibles | Ocultos en esta versión de Windows |
 
-El porcentaje de 3D del Administrador de tareas se calcula sobre la velocidad actual de la placa, así que un porcentaje parecido a máxima velocidad es varias veces más trabajo real que en reposo; el consumo de la placa es la comparación más clara. Una sola PC y un solo video: en otro hardware los resultados pueden variar.
+El porcentaje de 3D del Administrador de tareas se calcula sobre la velocidad actual de la placa, así que un porcentaje parecido a máxima velocidad es varias veces más trabajo real que en reposo; el consumo de la placa es la comparación más clara. Una sola PC y un solo video: en otro hardware los resultados pueden variar. (Mientras Wallpaper Alive estaba abierto, en esta PC desaparecieron los íconos del escritorio; puede haber sido un problema local y no se investigó.)
 ## Funciones
 
 - **Todos los monitores**, cada uno con su ventana y su propia pausa. Un mismo archivo HAP llena cualquier resolución y proporción (se escala y recorta al centro en la placa).
