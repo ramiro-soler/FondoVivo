@@ -45,7 +45,7 @@ Same PC (RTX 3060, Ryzen 7 5800X, Windows 11, one 2560×1440 monitor at 200 Hz),
 | RAM (working set) | **51 MB**, 1 process | 552 MB, 5 processes |
 | CPU | 0.5 % | 0.65 % |
 
-Task Manager's 3D percentage is relative to the GPU's current clock speed, so a similar percentage at maximum clocks is several times more real work than at idle clocks; board power is the clearest comparison. One machine, one video: results on other hardware may differ. (While Wallpaper Alive was running, the desktop icons disappeared on this PC; that may have been a local issue and wasn't investigated.)
+Task Manager's 3D percentage is relative to the GPU's current clock speed, so a similar percentage at maximum clocks is several times more real work than at idle clocks; board power is the clearest comparison. One machine, one video: results on other hardware may differ.
 ## Features
 
 - **Every monitor**, each with its own window and its own pause state. One HAP file fills any resolution and aspect ratio (scaled and center-cropped on the GPU).
