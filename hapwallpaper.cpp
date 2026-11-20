@@ -369,7 +369,7 @@ static DWORD WINAPI RenderThread(LPVOID param) {
             if (hf == INVALID_HANDLE_VALUE || !buf[0] || !buf[1]) { releaseHap(); Sleep(500); continue; }
         }
         // Espera el proximo refresco (la cola del swap chain tiene lugar).
-        if (waitNext && WaitForSingleObject(s->frameWait, 100) != WAIT_OBJECT_0) { waitNext = false; continue; }
+        if (waitNext && s->frameWait && WaitForSingleObject(s->frameWait, 100) != WAIT_OBJECT_0) { waitNext = false; continue; }
         waitNext = false;
         if (hap) {
             // Reloj propio: solo avanza mientras se reproduce.
@@ -410,51 +410,54 @@ static DWORD WINAPI RenderThread(LPVOID param) {
             if (s->engine->OnVideoStreamTick(&pts) == S_OK) { haveFrame = true; frameVer++; }
         }
         if (!haveFrame) { Sleep(2); continue; }
+        // Dibuja el cuadro actual en el buffer del swap chain que toca.
+        auto drawCurrent = [&]() -> bool {
+            bool ok = false;
+            ID3D11Texture2D* back = nullptr;
+            if (FAILED(s->swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back))) return false;
+            if (hap) {
+                ID3D11RenderTargetView* rtv = nullptr;
+                if (SUCCEEDED(g_d3d->CreateRenderTargetView(back, nullptr, &rtv))) {
+                    D3D11_VIEWPORT vp = { 0, 0, (float)sd.Width, (float)sd.Height, 0, 1 };
+                    EnterCriticalSection(&g_ctxLock);
+                    ctx->OMSetRenderTargets(1, &rtv, nullptr);
+                    ctx->RSSetViewports(1, &vp);
+                    ctx->IASetInputLayout(nullptr);
+                    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    ctx->VSSetShader(g_vs, nullptr, 0);
+                    ctx->VSSetConstantBuffers(0, 1, &s->cb);
+                    ctx->PSSetShader(g_ps, nullptr, 0);
+                    ctx->PSSetShaderResources(0, 1, &s->hapSrv);
+                    ctx->PSSetSamplers(0, 1, &g_sampler);
+                    ctx->Draw(3, 0);
+                    ID3D11RenderTargetView* none = nullptr;
+                    ctx->OMSetRenderTargets(1, &none, nullptr);
+                    LeaveCriticalSection(&g_ctxLock);
+                    rtv->Release();
+                    ok = true;
+                }
+            } else {
+                RECT dst = { 0, 0, (LONG)sd.Width, (LONG)sd.Height };
+                EnterCriticalSection(&g_ctxLock);
+                ok = SUCCEEDED(s->engine->TransferVideoFrame(back, &src, &dst, nullptr));
+                LeaveCriticalSection(&g_ctxLock);
+            }
+            back->Release();
+            return ok;
+        };
         // Cada buffer del swap chain se redibuja solo cuando tiene un cuadro viejo (una vez
         // por buffer por cuadro de video, sin copias intermedias).
         UINT idx = sc3 ? sc3->GetCurrentBackBufferIndex() : 0;
         if (idx > 3) idx = 0;
         bool drawn = false;
-        if (!sc3 || bufVer[idx] != frameVer) {
-            ID3D11Texture2D* back = nullptr;
-            if (SUCCEEDED(s->swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back))) {
-                if (hap) {
-                    ID3D11RenderTargetView* rtv = nullptr;
-                    if (SUCCEEDED(g_d3d->CreateRenderTargetView(back, nullptr, &rtv))) {
-                        D3D11_VIEWPORT vp = { 0, 0, (float)sd.Width, (float)sd.Height, 0, 1 };
-                        EnterCriticalSection(&g_ctxLock);
-                        ctx->OMSetRenderTargets(1, &rtv, nullptr);
-                        ctx->RSSetViewports(1, &vp);
-                        ctx->IASetInputLayout(nullptr);
-                        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                        ctx->VSSetShader(g_vs, nullptr, 0);
-                        ctx->VSSetConstantBuffers(0, 1, &s->cb);
-                        ctx->PSSetShader(g_ps, nullptr, 0);
-                        ctx->PSSetShaderResources(0, 1, &s->hapSrv);
-                        ctx->PSSetSamplers(0, 1, &g_sampler);
-                        ctx->Draw(3, 0);
-                        ID3D11RenderTargetView* none = nullptr;
-                        ctx->OMSetRenderTargets(1, &none, nullptr);
-                        LeaveCriticalSection(&g_ctxLock);
-                        rtv->Release();
-                        drawn = true;
-                    }
-                } else {
-                    RECT dst = { 0, 0, (LONG)sd.Width, (LONG)sd.Height };
-                    EnterCriticalSection(&g_ctxLock);
-                    drawn = SUCCEEDED(s->engine->TransferVideoFrame(back, &src, &dst, nullptr));
-                    LeaveCriticalSection(&g_ctxLock);
-                }
-                if (drawn) bufVer[idx] = frameVer;
-                back->Release();
-            }
-        }
-        // En los refrescos repetidos se presenta con un rectangulo sucio minimo: Windows
-        // casi no recompone, pero el monitor sigue a su frecuencia maxima.
-        RECT tiny = { 0, 0, 1, 1 };
+        if ((!sc3 || bufVer[idx] != frameVer) && drawCurrent()) { bufVer[idx] = frameVer; drawn = true; }
+        // En los refrescos en los que el cuadro no cambio se presenta con DO_NOT_SEQUENCE:
+        // se vuelve a mostrar el mismo buffer sin copiarlo ni recomponerlo, y el monitor
+        // sigue a su frecuencia maxima. (Un rectangulo sucio de 1x1 hacia que DXGI copiara
+        // el cuadro entero en cada refresco: 10 % de 3D contra ~2 %.)
         DXGI_PRESENT_PARAMETERS pp = {};
-        if (!drawn && sc3) { pp.DirtyRectsCount = 1; pp.pDirtyRects = &tiny; }
-        if (SUCCEEDED(s->swap->Present1(1, 0, &pp))) { waitNext = true; s->shown = true; }
+        UINT flags = (!drawn && sc3) ? DXGI_PRESENT_DO_NOT_SEQUENCE : 0;
+        if (SUCCEEDED(s->swap->Present1(1, flags, &pp))) { waitNext = true; s->shown = true; }
         else Sleep(5);
     }
     releaseHap();
@@ -852,8 +855,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (!wcscmp(argv[i], L"--debug")) g_debug = true;
         else if (!wcscmp(argv[i], L"--nopause")) g_noAutoPause = true;
         else if (!wcscmp(argv[i], L"--notaskbar")) g_taskbar = false;
-        else if (!wcscmp(argv[i], L"--noautostart")) g_noAutostart = true;
-        else { g_videoPath = argv[i]; explicitPath = true; }
+        else if (!wcscmp(argv[i], L"--noautostart")) g_noAutostart = true;        else { g_videoPath = argv[i]; explicitPath = true; }
     }
     LocalFree(argv);
     // La DLL de la barra solo escribe tb_log.txt si existe este evento.

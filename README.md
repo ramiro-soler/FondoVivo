@@ -16,7 +16,7 @@ HapWallpaper brings that path to the **Windows desktop**, instead of relying on 
 |---|---|---|
 | Decoding | GPU video decoder (NVDEC, VCN, Quick Sync) or CPU | **None**: the frame is copied as-is into a BC1 texture |
 | Color conversion | YUV → RGB every frame | Not needed: BC1 is already RGB |
-| High-refresh G-Sync / FreeSync monitors | A 30/60 fps video drags the panel down to 30/60 Hz | Presents on every refresh; when the frame didn't change it draws nothing and hands Windows a 1×1 dirty rect, so the monitor stays at its maximum rate |
+| High-refresh G-Sync / FreeSync monitors | A 30/60 fps video drags the panel down to 30/60 Hz | Presents on every refresh; when the frame didn't change it re-presents the same buffer (`DXGI_PRESENT_DO_NOT_SEQUENCE`) without drawing or copying anything, so the monitor stays at its maximum rate |
 | Maximized or fullscreen windows | Often keeps playing (or stutters on resume) | Pauses **per monitor** instantly; the last frame stays visible behind a transparent taskbar |
 | RAM | StarPaper measures 110–146 MB; mpv/WebView-based apps use more | **~51 MB playing, ~1 MB paused**: frames are streamed from disk one at a time, bypassing the file cache |
 | Paused | Varies | 0 % GPU |
@@ -27,7 +27,8 @@ Measured on an RTX 3060, 2560×1440 @ 200 Hz, 30 fps video:
 |---|---|---|---|
 | GPU video decoder | 28–44 % | 6–18 % | **0 %** |
 | CPU | 2.4 % | 0.4 % | 0.5 % |
-| GPU board power (idle: 18 W) | 22.2 W | 20.7 W | **19.5–20 W** |
+| GPU 3D engine (wallpaper + compositor) | | | **~2 %** |
+| GPU board power (no wallpaper: 18 W) | 22.2 W | 20.7 W | **18.7 W** |
 | RAM (working set) | | | **51 MB** (1 MB paused) |
 
 The trade-off: a HAP file is large (~1.8 MB per frame at 1440p, ~1 GB for 18 s at 30 fps) on disk, and it is read at ~55 MB/s while playing (trivial for an SSD; avoid putting it on a hard drive). If you prefer a small file, HapWallpaper also plays any MP4/AV1 Windows can decode, with the same presentation.
