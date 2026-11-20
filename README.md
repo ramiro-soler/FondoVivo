@@ -17,19 +17,47 @@ Medido en una RTX 3060 con un monitor 2560×1440 a 200 Hz y un video de 30 fps: 
 
 ## Preparar el video
 
-El archivo HAP debe tener exactamente la resolución del monitor principal (ancho y alto múltiplos de 4). Con [ffmpeg](https://ffmpeg.org/):
+Lo más fácil es usar `preparar_video.ps1`, que hace todo con [ffmpeg](https://ffmpeg.org/) (si no lo tenés: `winget install --id Gyan.FFmpeg -e`):
 
 ```powershell
-ffmpeg -i video.mp4 -vf "scale=2560:1440,fps=30" -c:v hap -format hap -compressor none -f rawvideo fondo.hap
+.\preparar_video.ps1 -Video C:\videos\mi_fondo.mp4
 ```
 
-Ocupa unos 1,8 MB por cuadro a 2560×1440 (≈1 GB para 18 s a 30 fps). Si preferís un archivo chico, poné un `fondo.mp4` (por ejemplo AV1) y no pongas `fondo.hap`:
+El script:
+
+- detecta la resolución del monitor principal y escala/recorta el video para llenar la pantalla sin bordes;
+- lo pasa a 30 fps (cambialo con `-Fps`);
+- genera `fondo.hap` junto al script y verifica que FondoVivo lo pueda leer;
+- avisa cuánto va a ocupar y si no hay espacio en el disco.
+
+| Opción | Para qué |
+|---|---|
+| `-Formato hap` / `av1` / `ambos` | `hap` = 0 % de decodificador pero archivo grande (~1,8 MB por cuadro a 1440p). `av1` = `fondo.mp4` chico que usa el decodificador de la placa. `ambos` deja el MP4 como respaldo |
+| `-Inicio 5 -Duracion 20` | Usar solo un tramo del video (en segundos). Menos duración = `.hap` más chico |
+| `-SombraReloj` | Oscurece suavemente la esquina del reloj y la bandeja, para leerlos mejor con la barra transparente |
+| `-Ancho 1920 -Alto 1080` | Forzar una resolución (si la detección falla o es para otra PC) |
+| `-Salida C:\ruta` | Carpeta de salida (por defecto, la del script) |
+
+Ejemplo completo:
 
 ```powershell
-ffmpeg -i video.mp4 -vf "scale=2560:1440,fps=30" -c:v libsvtav1 -crf 30 -an fondo.mp4
+.\preparar_video.ps1 -Video mi_fondo.mp4 -Formato ambos -Inicio 2 -Duracion 18 -SombraReloj
 ```
 
-Dejá `fondo.hap` o `fondo.mp4` en la misma carpeta que `FondoVivo.exe`.
+Consejos: los videos que hacen bucle sin corte se ven mejor; 30 fps alcanza para fondos lentos; si el `.hap` queda muy grande, acortá la duración.
+
+<details>
+<summary>Hacerlo a mano con ffmpeg</summary>
+
+El HAP debe tener exactamente la resolución del monitor principal (múltiplos de 4) y sin compresión Snappy:
+
+```powershell
+ffmpeg -i video.mp4 -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,fps=30" -pix_fmt rgba -c:v hap -format hap -compressor none -f rawvideo fondo.hap
+ffmpeg -i video.mp4 -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,fps=30" -c:v libsvtav1 -crf 30 -an fondo.mp4
+```
+</details>
+
+Dejá `fondo.hap` y/o `fondo.mp4` en la misma carpeta que `FondoVivo.exe` (si están los dos, usa el `.hap`).
 
 ## Compilar
 
