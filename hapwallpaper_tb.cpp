@@ -1,7 +1,7 @@
-// FondoVivoTB.dll - se carga dentro de Explorer mediante la API de diagnostico
+// HapWallpaperTB.dll - se carga dentro de Explorer mediante la API de diagnostico
 // XAML (igual que TranslucentTB) y oculta el fondo ("BackgroundFill") y la linea
 // superior ("BackgroundStroke") de la barra de tareas de Windows 11, poniendo su
-// opacidad en 0. La transparencia de la ventana en si la aplica FondoVivo.exe.
+// opacidad en 0. La transparencia de la ventana en si la aplica HapWallpaper.exe.
 
 #ifndef UNICODE
 #define UNICODE
@@ -15,8 +15,8 @@
 #include <cstdio>
 #include <cwchar>
 
-// {8C1F6B2E-4A7D-4E2B-9A51-3D7E2F60B14C}
-static const CLSID CLSID_FondoVivoTap = { 0x8c1f6b2e, 0x4a7d, 0x4e2b, { 0x9a, 0x51, 0x3d, 0x7e, 0x2f, 0x60, 0xb1, 0x4c } };
+// {C96D667B-21D9-420A-844C-874FCA567138}
+static const CLSID CLSID_HapWallpaperTap = { 0xc96d667b, 0x21d9, 0x420a, { 0x84, 0x4c, 0x87, 0x4f, 0xca, 0x56, 0x71, 0x38 } };
 static const IID FV_IID_IVisualTreeService3 = { 0x0e79c6e0, 0x85a0, 0x4be8, { 0xb4, 0x1a, 0x65, 0x5c, 0xf1, 0xfd, 0x19, 0xbd } };
 static const IID FV_IID_IXamlDiagnostics = { 0x18c9e2b6, 0x3f43, 0x4116, { 0x9f, 0x2b, 0xff, 0x93, 0x5d, 0x77, 0x70, 0xd2 } };
 static const IID FV_IID_IVisualTreeServiceCallback = { 0xaa7a8931, 0x80e4, 0x4fec, { 0x8f, 0x3b, 0x55, 0x3f, 0x87, 0xb4, 0x96, 0x6e } };
@@ -184,14 +184,14 @@ public:
 static Factory g_factory;
 
 extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv) {
-    if (clsid != CLSID_FondoVivoTap) return CLASS_E_CLASSNOTAVAILABLE;
+    if (clsid != CLSID_HapWallpaperTap) return CLASS_E_CLASSNOTAVAILABLE;
     return g_factory.QueryInterface(riid, ppv);
 }
 
 extern "C" __declspec(dllexport) HRESULT __stdcall DllCanUnloadNow() { return S_FALSE; }
 
 // ---- Arranque dentro de Explorer -------------------------------------------
-// FondoVivo.exe instala un hook de mensajes en el hilo de la barra; cuando Explorer
+// HapWallpaper.exe instala un hook de mensajes en el hilo de la barra; cuando Explorer
 // carga esta DLL por el hook, se fija en memoria y se registra a si misma como TAP
 // de diagnostico XAML del propio proceso (asi lo hace tambien TranslucentTB).
 typedef HRESULT (WINAPI *PFN_IXDE)(PCWSTR, DWORD, PCWSTR, PCWSTR, CLSID, PCWSTR);
@@ -211,14 +211,14 @@ static DWORD WINAPI InitThread(LPVOID) {
     for (n = 1; n < 100; n++) {
         wchar_t conn[48];
         swprintf(conn, 48, L"VisualDiagConnection%d", n);
-        hr = ixde(conn, GetCurrentProcessId(), nullptr, path, CLSID_FondoVivoTap, nullptr);
+        hr = ixde(conn, GetCurrentProcessId(), nullptr, path, CLSID_HapWallpaperTap, nullptr);
         if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) break;
     }
     Log(L"Registrado en Explorer (conexion %d): 0x%08X", n, (unsigned)hr);
     if (SUCCEEDED(hr)) {
         wchar_t name[64];
-        swprintf(name, 64, L"Local\\FondoVivoTB_%u", (unsigned)GetCurrentProcessId());
-        g_readyEvent = CreateEventW(nullptr, TRUE, TRUE, name); // FondoVivo.exe lo usa para saber que ya esta
+        swprintf(name, 64, L"Local\\HapWallpaperTB_%u", (unsigned)GetCurrentProcessId());
+        g_readyEvent = CreateEventW(nullptr, TRUE, TRUE, name); // HapWallpaper.exe lo usa para saber que ya esta
     } else {
         InterlockedExchange(&g_started, 0); // permite reintentar
     }

@@ -1,10 +1,10 @@
-// FondoVivo - fondo de pantalla animado ultraliviano.
+// HapWallpaper - fondo de pantalla animado ultraliviano.
 // Reproduce un video en bucle detras de los iconos del escritorio usando
 // Media Foundation (decodificacion por GPU). Se pausa solo cuando una ventana
 // maximizada / a pantalla completa tapa el escritorio, al bloquear la sesion
 // o con la pantalla apagada.
 //
-// Uso: FondoVivo.exe [ruta_video|ruta.hap] [--debug] [--nopause] [--notaskbar] [--noautostart]
+// Uso: HapWallpaper.exe [ruta_video|ruta.hap] [--debug] [--nopause] [--notaskbar] [--noautostart]
 //   Sin ruta usa "fondo.hap" junto al .exe si existe (cuadros BC1, sin decodificador de
 //   video) y si no "fondo.mp4" (Media Foundation). --debug escribe log.txt junto al .exe.
 
@@ -140,11 +140,16 @@ static bool CreateEngine(HWND hwnd, bool useDxgi) {
 // fondo.hap: cuadros DXT1/BC1 de HAP sin compresion extra (ffmpeg -c:v hap -compressor
 // none -f rawvideo). La placa lee BC1 directamente: no se usa el decodificador de video,
 // solo se sube el cuadro (1,8 MB) y se dibuja con un shader minimo.
+// Al final del archivo, preparar_video.ps1 agrega un bloque de 32 bytes con los datos
+// del video (sin el bloque se asume 30 fps, como los primeros archivos).
+#pragma pack(push, 1)
+struct HapTrailer { char magic[8]; UINT width, height, fpsNum, fpsDen, frames, stride; };
+#pragma pack(pop)
+static const char kHapMagic[8] = { 'H', 'A', 'P', 'W', 'A', 'L', 'L', '1' };
 static std::wstring g_hapPath;
 static HANDLE g_hapFile, g_hapMap;
-static const BYTE* g_hapData;
-static UINT g_hapFrames, g_hapStride, g_hapHdr, g_hapW, g_hapH;
-static const double g_hapFps = 30.0;
+static bool g_hapReady; // archivo validado; cada hilo de render mapea y suelta su propia vista
+static UINT g_hapFrames, g_hapStride, g_hapHdr, g_hapW, g_hapH, g_hapFpsNum = 30, g_hapFpsDen = 1;
 static ID3D11Texture2D* g_hapTex;
 static ID3D11ShaderResourceView* g_hapSrv;
 static ID3D11VertexShader* g_vs;
@@ -153,12 +158,13 @@ static ID3D11PixelShader* g_ps;
 typedef HRESULT (WINAPI *PFN_D3DCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
 
 static bool InitHap(UINT w, UINT h) {
-    if (g_hapData && g_hapW == w && g_hapH == h) return true;
-    if (g_hapData) return false;
+    if (g_hapReady && g_hapW == w && g_hapH == h) return true;
+    if (g_hapReady) return false;
     g_hapFile = CreateFileW(g_hapPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (g_hapFile == INVALID_HANDLE_VALUE) { g_hapFile = nullptr; return false; }
     LARGE_INTEGER size; GetFileSizeEx(g_hapFile, &size);
     g_hapMap = CreateFileMappingW(g_hapFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    // Vista temporal solo para validar; se suelta antes de reproducir.
     const BYTE* p = g_hapMap ? (const BYTE*)MapViewOfFile(g_hapMap, FILE_MAP_READ, 0, 0, 0) : nullptr;
     UINT payload = w * h / 2;
     bool ok = p && size.QuadPart > 8 && (p[3] & 0x0F) == 0x0B && (p[3] & 0xF0) == 0xA0; // DXT1, sin Snappy
@@ -167,18 +173,27 @@ static bool InitHap(UINT w, UINT h) {
         g_hapHdr = s24 ? 4 : 8;
         UINT s = s24 ? s24 : *(const UINT*)(p + 4);
         g_hapStride = g_hapHdr + payload;
-        ok = s == payload && size.QuadPart % g_hapStride == 0;
-        g_hapFrames = ok ? (UINT)(size.QuadPart / g_hapStride) : 0;
+        LONGLONG data = size.QuadPart;
+        const HapTrailer* t = size.QuadPart >= (LONGLONG)sizeof(HapTrailer)
+            ? (const HapTrailer*)(p + size.QuadPart - sizeof(HapTrailer)) : nullptr;
+        if (t && !memcmp(t->magic, kHapMagic, 8)) {
+            data -= sizeof(HapTrailer);
+            ok = t->width == w && t->height == h && t->stride == g_hapStride && t->fpsNum && t->fpsDen &&
+                 (LONGLONG)t->frames * g_hapStride == data;
+            if (ok) { g_hapFpsNum = t->fpsNum; g_hapFpsDen = t->fpsDen; }
+        }
+        ok = ok && s == payload && data % g_hapStride == 0;
+        g_hapFrames = ok ? (UINT)(data / g_hapStride) : 0;
     }
+    if (p) UnmapViewOfFile(p);
     if (!ok || !g_hapFrames) {
-        Log(L"fondo.hap no coincide con la pantalla %ux%u; se usa el video", w, h);
-        if (p) UnmapViewOfFile(p);
+        Log(L"El archivo HAP no coincide con la pantalla %ux%u; se usa el video", w, h);
         if (g_hapMap) CloseHandle(g_hapMap);
         CloseHandle(g_hapFile); g_hapMap = g_hapFile = nullptr;
         g_hapPath.clear();
         return false;
     }
-    g_hapData = p; g_hapW = w; g_hapH = h;
+    g_hapReady = true; g_hapW = w; g_hapH = h;
 
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
@@ -205,8 +220,8 @@ static bool InitHap(UINT w, UINT h) {
     } else if (SUCCEEDED(hr)) hr = E_FAIL;
     if (vsb) vsb->Release();
     if (psb) psb->Release();
-    if (FAILED(hr)) { Log(L"No se pudo preparar HAP: 0x%08X", (unsigned)hr); g_hapPath.clear(); g_hapData = nullptr; return false; }
-    Log(L"HAP: %u cuadros %ux%u", g_hapFrames, w, h);
+    if (FAILED(hr)) { Log(L"No se pudo preparar HAP: 0x%08X", (unsigned)hr); g_hapPath.clear(); g_hapReady = false; return false; }
+    Log(L"HAP: %u cuadros %ux%u a %u/%u fps", g_hapFrames, w, h, g_hapFpsNum, g_hapFpsDen);
     return true;
 }
 
@@ -236,7 +251,7 @@ static DWORD WINAPI RenderThread(LPVOID) {
             WaitForSingleObject(g_runEvent, INFINITE);
         }
         if (g_rtStop) break;
-        if (g_hapData && !hapView) {
+        if (g_hapReady && !hapView) {
             hapView = (const BYTE*)MapViewOfFile(g_hapMap, FILE_MAP_READ, 0, 0, 0);
             if (!hapView) { Sleep(100); continue; }
         }
@@ -244,13 +259,13 @@ static DWORD WINAPI RenderThread(LPVOID) {
         if (waitNext && WaitForSingleObject(g_frameWait, 100) != WAIT_OBJECT_0) { waitNext = false; continue; }
         waitNext = false;
         LONGLONG pts;
-        bool hap = g_hapData != nullptr;
+        bool hap = g_hapReady;
         if (hap) {
             // Reloj propio: solo avanza mientras se reproduce (saltos de pausa recortados).
             LARGE_INTEGER now; QueryPerformanceCounter(&now);
             if (hapLast) { LONGLONG dt = now.QuadPart - hapLast; if (dt > qpf.QuadPart / 20) dt = qpf.QuadPart / 20; hapAcc += dt; }
             hapLast = now.QuadPart;
-            UINT f = (UINT)((hapAcc * (LONGLONG)g_hapFps / qpf.QuadPart) % g_hapFrames);
+            UINT f = (UINT)((hapAcc * (LONGLONG)g_hapFpsNum / (qpf.QuadPart * (LONGLONG)g_hapFpsDen)) % g_hapFrames);
             if (f != hapCur) {
                 ctx->UpdateSubresource(g_hapTex, 0, nullptr, hapView + (size_t)f * g_hapStride + g_hapHdr, (g_hapW / 4) * 8, 0);
                 hapCur = f; frameVer++; haveFrame = true;
@@ -403,7 +418,7 @@ static void Attach() {
     RECT mon = PrimaryMonitorRect();
     POINT pts[2] = { { mon.left, mon.top }, { mon.right, mon.bottom } };
     MapWindowPoints(HWND_DESKTOP, worker, pts, 2);
-    g_videoWnd = CreateWindowExW(WS_EX_NOACTIVATE, L"FondoVivoVideo", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+    g_videoWnd = CreateWindowExW(WS_EX_NOACTIVATE, L"HapWallpaperVideo", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                                  pts[0].x, pts[0].y, pts[1].x - pts[0].x, pts[1].y - pts[0].y,
                                  worker, nullptr, g_inst, nullptr);
     if (!g_videoWnd) { Log(L"No se pudo crear la ventana de video"); return; }
@@ -466,7 +481,7 @@ static bool FullscreenAppRunning() {
 
 static void UpdateTrayTip() {
     bool paused = g_userPaused || g_autoPaused || g_locked || g_displayOff;
-    swprintf(g_nid.szTip, 128, L"Fondo Vivo - %ls", g_userPaused ? L"pausado" : paused ? L"en pausa automatica" : L"reproduciendo");
+    swprintf(g_nid.szTip, 128, L"HapWallpaper - %ls", g_userPaused ? L"pausado" : paused ? L"en pausa automatica" : L"reproduciendo");
     g_nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
@@ -495,7 +510,7 @@ static void Check() {
 
 // ------------------------------------------------------- Barra transparente
 // Reemplazo de TranslucentTB: la ventana de la barra se vuelve transparente con
-// SetWindowCompositionAttribute y FondoVivoTB.dll (cargada en Explorer) oculta
+// SetWindowCompositionAttribute y HapWallpaperTB.dll (cargada en Explorer) oculta
 // el fondo XAML y la linea superior.
 struct AccentPolicy { int State, Flags, Color, Anim; };
 struct WinCompAttrData { int Attr; void* Data; ULONG Size; };
@@ -536,9 +551,9 @@ static void InjectTaskbar() {
     if (pid != lastPid) { lastPid = pid; g_injectTries = 0; } // Explorer se reinicio
     if (!pid || pid == g_injectedPid) return;
 
-    // Ya cargada en este Explorer (por ejemplo, si FondoVivo se reinicio)?
+    // Ya cargada en este Explorer (por ejemplo, si HapWallpaper se reinicio)?
     wchar_t evName[64];
-    swprintf(evName, 64, L"Local\\FondoVivoTB_%u", (unsigned)pid);
+    swprintf(evName, 64, L"Local\\HapWallpaperTB_%u", (unsigned)pid);
     if (HANDLE ev = OpenEventW(SYNCHRONIZE, FALSE, evName)) {
         CloseHandle(ev);
         if (g_tbHook) { UnhookWindowsHookEx(g_tbHook); g_tbHook = nullptr; }
@@ -552,11 +567,11 @@ static void InjectTaskbar() {
         UnhookWindowsHookEx(g_tbHook); g_tbHook = nullptr;
     }
     if (g_injectTries >= 30) return;
-    std::wstring dll = g_exeDir + L"\\FondoVivoTB.dll";
+    std::wstring dll = g_exeDir + L"\\HapWallpaperTB.dll";
     static HMODULE mod = nullptr;
     if (!mod) mod = LoadLibraryW(dll.c_str());
     HOOKPROC proc = mod ? (HOOKPROC)GetProcAddress(mod, "FvGetMsgProc") : nullptr;
-    if (!proc) { Log(L"No se pudo cargar FondoVivoTB.dll"); g_injectTries = 30; return; }
+    if (!proc) { Log(L"No se pudo cargar HapWallpaperTB.dll"); g_injectTries = 30; return; }
     g_injectTries++;
     DWORD tid = GetWindowThreadProcessId(tray, nullptr);
     g_tbHook = SetWindowsHookExW(WH_GETMESSAGE, proc, mod, tid);
@@ -577,7 +592,7 @@ static void AddTray() {
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = LoadIconW(g_inst, MAKEINTRESOURCEW(1));
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wcscpy(g_nid.szTip, L"Fondo Vivo");
+    wcscpy(g_nid.szTip, L"HapWallpaper");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
@@ -654,7 +669,7 @@ static LRESULT CALLBACK VideoProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g_inst = inst;
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"FondoVivo_SingleInstance");
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"HapWallpaper_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -675,7 +690,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     else if (g_videoPath == g_exeDir + L"\\fondo.mp4" && GetFileAttributesW((g_exeDir + L"\\fondo.hap").c_str()) != INVALID_FILE_ATTRIBUTES)
         g_hapPath = g_exeDir + L"\\fondo.hap";
     if (GetFileAttributesW(g_videoPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        MessageBoxW(nullptr, (L"No se encontro el video:\n" + g_videoPath).c_str(), L"Fondo Vivo", MB_ICONERROR);
+        MessageBoxW(nullptr, (L"No se encontro el video:\n" + g_videoPath).c_str(), L"HapWallpaper", MB_ICONERROR);
         return 1;
     }
     Log(L"Inicio, video: %ls", g_videoPath.c_str());
@@ -687,8 +702,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
             wchar_t cur[MAX_PATH * 2] = {};
             DWORD sz = sizeof(cur), type = 0;
-            if (RegQueryValueExW(k, L"FondoVivo", nullptr, &type, (BYTE*)cur, &sz) != ERROR_SUCCESS || cmd != cur)
-                RegSetValueExW(k, L"FondoVivo", 0, REG_SZ, (const BYTE*)cmd.c_str(), (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
+            if (RegQueryValueExW(k, L"HapWallpaper", nullptr, &type, (BYTE*)cur, &sz) != ERROR_SUCCESS || cmd != cur)
+                RegSetValueExW(k, L"HapWallpaper", 0, REG_SZ, (const BYTE*)cmd.c_str(), (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
             RegCloseKey(k);
         }
     }
@@ -698,15 +713,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     WNDCLASSW wc = {};
     wc.hInstance = inst;
-    wc.lpfnWndProc = MsgProc; wc.lpszClassName = L"FondoVivoMsg";
+    wc.lpfnWndProc = MsgProc; wc.lpszClassName = L"HapWallpaperMsg";
     RegisterClassW(&wc);
-    wc.lpfnWndProc = VideoProc; wc.lpszClassName = L"FondoVivoVideo";
+    wc.lpfnWndProc = VideoProc; wc.lpszClassName = L"HapWallpaperVideo";
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
 
     WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
     // Ventana oculta (no message-only) para recibir TaskbarCreated y avisos de energia.
-    g_msgWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"FondoVivoMsg", L"FondoVivo", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
+    g_msgWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"HapWallpaperMsg", L"HapWallpaper", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
     WTSRegisterSessionNotification(g_msgWnd, NOTIFY_FOR_THIS_SESSION);
     RegisterPowerSettingNotification(g_msgWnd, &FV_GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE);
 

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Convierte cualquier video en el fondo de FondoVivo (fondo.hap y/o fondo.mp4).
+  Convierte cualquier video en el fondo de HapWallpaper (fondo.hap y/o fondo.mp4).
 
 .DESCRIPTION
   - Detecta la resolucion del monitor principal (o usa -Ancho/-Alto).
@@ -88,8 +88,18 @@ if ($Formato -ne 'av1') {
     if ($LASTEXITCODE) { Write-Host "ffmpeg fallo." -ForegroundColor Red; exit 1 }
     $stride = $Ancho * $Alto / 2 + 8
     $len = (Get-Item $out).Length
-    if ($len % $stride) { Write-Host "Aviso: el archivo HAP no tiene cuadros de tamano fijo; FondoVivo usara el video MP4." -ForegroundColor Yellow }
-    else { Write-Host ("OK: {0} cuadros, {1:N0} MB" -f ($len / $stride), ($len / 1MB)) -ForegroundColor Green }
+    if ($len % $stride) { Write-Host "Aviso: el archivo HAP no tiene cuadros de tamano fijo; HapWallpaper usara el video MP4." -ForegroundColor Yellow }
+    else {
+        # Bloque final de 32 bytes con los datos del video, para que el reproductor
+        # sepa los fps: "HAPWALL1" + ancho, alto, fps (num/den), cuadros, bytes por cuadro.
+        $frames = [uint32]($len / $stride)
+        $fs = [IO.File]::Open($out, 'Append', 'Write')
+        $bw = New-Object IO.BinaryWriter($fs)
+        $bw.Write([Text.Encoding]::ASCII.GetBytes('HAPWALL1'))
+        foreach ($v in @($Ancho, $Alto, $Fps, 1, $frames, $stride)) { $bw.Write([uint32]$v) }
+        $bw.Close()
+        Write-Host ("OK: {0} cuadros a {1} fps, {2:N0} MB" -f $frames, $Fps, ($len / 1MB)) -ForegroundColor Green
+    }
 }
 if ($Formato -ne 'hap') {
     $out = Join-Path $Salida 'fondo.mp4'
@@ -98,4 +108,4 @@ if ($Formato -ne 'hap') {
     if ($LASTEXITCODE) { Write-Host "ffmpeg fallo." -ForegroundColor Red; exit 1 }
     Write-Host ("OK: {0:N1} MB" -f ((Get-Item $out).Length / 1MB)) -ForegroundColor Green
 }
-Write-Host ("Listo en {0:N0} s. Reinicia FondoVivo (clic derecho en la bandeja > Salir, y abrilo de nuevo)." -f $sw.Elapsed.TotalSeconds)
+Write-Host ("Listo en {0:N0} s. Reinicia HapWallpaper (clic derecho en la bandeja > Salir, y abrilo de nuevo)." -f $sw.Elapsed.TotalSeconds)
