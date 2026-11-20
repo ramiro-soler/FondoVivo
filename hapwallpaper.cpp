@@ -7,7 +7,8 @@
 // con la sesion bloqueada o con la pantalla apagada.
 //
 // Uso: HapWallpaper.exe [ruta_video|ruta.hap] [--debug] [--nopause] [--notaskbar] [--noautostart]
-//   Sin ruta usa "fondo.hap" junto al .exe si existe y si no "fondo.mp4".
+//   Sin ruta usa "wallpaper.hap" junto al .exe si existe y si no "wallpaper.mp4"
+//   (tambien acepta los nombres anteriores fondo.hap / fondo.mp4).
 //   --debug escribe log.txt junto al .exe (y tb_log.txt la DLL de la barra).
 
 #ifndef UNICODE
@@ -169,10 +170,10 @@ static IMFMediaEngine* CreateEngine(HWND hwnd, bool useDxgi) {
 }
 
 // ------------------------------------------------- Modo HAP (cuadros ya comprimidos)
-// fondo.hap: cuadros DXT1/BC1 de HAP sin compresion extra (ffmpeg -c:v hap -compressor
+// wallpaper.hap: cuadros DXT1/BC1 de HAP sin compresion extra (ffmpeg -c:v hap -compressor
 // none -f rawvideo). La placa lee BC1 directamente: no se usa el decodificador de video,
 // solo se sube el cuadro y se dibuja con un shader que lo escala para llenar cada monitor.
-// Al final del archivo, preparar_video.ps1 agrega un bloque de 32 bytes con los datos
+// Al final del archivo, prepare_video.ps1 agrega un bloque de 32 bytes con los datos
 // del video. Sin el bloque se asume 30 fps y la resolucion del monitor principal.
 #pragma pack(push, 1)
 struct HapTrailer { char magic[8]; UINT width, height, fpsNum, fpsDen, frames, stride; };
@@ -519,8 +520,8 @@ static void Attach() {
     if (!g_hapPath.empty() && !InitHap() && !g_hapWarned) {
         g_hapWarned = true;
         bool mp4 = GetFileAttributesW(g_videoPath.c_str()) != INVALID_FILE_ATTRIBUTES;
-        Balloon(L"HapWallpaper", mp4 ? L"No se pudo usar el archivo .hap; se reproduce el video MP4. Volve a generarlo con preparar_video.ps1."
-                                     : L"No se pudo usar el archivo .hap. Volve a generarlo con preparar_video.ps1.");
+        Balloon(L"HapWallpaper", mp4 ? L"The .hap file could not be used; playing the MP4 instead. Recreate it with prepare_video.ps1."
+                                     : L"The .hap file could not be used. Recreate it with prepare_video.ps1.");
     }
     EnumDisplayMonitors(nullptr, nullptr, EnumMonProc, (LPARAM)worker);
     Log(L"Adjuntado a WorkerW %p, %u monitores", worker, (unsigned)g_screens.size());
@@ -566,8 +567,8 @@ static bool FullscreenAppRunning() {
 static void UpdateTrayTip() {
     unsigned playing = 0;
     for (Screen* s : g_screens) if (!ShouldPause(s)) playing++;
-    if (g_userPaused) swprintf(g_nid.szTip, 128, L"HapWallpaper - pausado");
-    else swprintf(g_nid.szTip, 128, L"HapWallpaper - %u de %u monitores reproduciendo%ls", playing, (unsigned)g_screens.size(),
+    if (g_userPaused) swprintf(g_nid.szTip, 128, L"HapWallpaper - paused");
+    else swprintf(g_nid.szTip, 128, L"HapWallpaper - playing on %u of %u monitors%ls", playing, (unsigned)g_screens.size(),
                   g_hapReady ? L" (HAP)" : L"");
     g_nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
@@ -692,9 +693,9 @@ static void AddTray() {
 
 static void ShowMenu() {
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, IDM_TOGGLE, g_userPaused ? L"Reanudar" : L"Pausar");
+    AppendMenuW(m, MF_STRING, IDM_TOGGLE, g_userPaused ? L"Resume" : L"Pause");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, IDM_EXIT, L"Salir");
+    AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit");
     POINT p; GetCursorPos(&p);
     SetForegroundWindow(g_msgWnd);
     TrackPopupMenu(m, TPM_RIGHTBUTTON, p.x, p.y, 0, g_msgWnd, nullptr);
@@ -769,7 +770,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     g_exeDir = exe; g_exeDir = g_exeDir.substr(0, g_exeDir.find_last_of(L'\\'));
-    g_videoPath = g_exeDir + L"\\fondo.mp4";
+    // Nombres por defecto (y los anteriores en espanol, por compatibilidad).
+    auto exists = [](const std::wstring& f) { return GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES; };
+    g_videoPath = g_exeDir + L"\\wallpaper.mp4";
+    if (!exists(g_videoPath) && exists(g_exeDir + L"\\fondo.mp4")) g_videoPath = g_exeDir + L"\\fondo.mp4";
+    std::wstring defaultHap = g_exeDir + L"\\wallpaper.hap";
+    if (!exists(defaultHap) && exists(g_exeDir + L"\\fondo.hap")) defaultHap = g_exeDir + L"\\fondo.hap";
     bool explicitPath = false;
     int argc; wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; i < argc; i++) {
@@ -783,14 +789,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     // La DLL de la barra solo escribe tb_log.txt si existe este evento.
     HANDLE debugEvent = g_debug ? CreateEventW(nullptr, TRUE, TRUE, L"Local\\HapWallpaperDebug") : nullptr;
 
-    // fondo.hap junto al .exe (o un .hap pasado como argumento) tiene prioridad sobre el video.
+    // wallpaper.hap junto al .exe (o un .hap pasado como argumento) tiene prioridad sobre el video.
     if (g_videoPath.size() > 4 && !_wcsicmp(g_videoPath.c_str() + g_videoPath.size() - 4, L".hap")) g_hapPath = g_videoPath;
-    else if (!explicitPath && GetFileAttributesW((g_exeDir + L"\\fondo.hap").c_str()) != INVALID_FILE_ATTRIBUTES)
-        g_hapPath = g_exeDir + L"\\fondo.hap";
-    bool haveVideo = GetFileAttributesW(g_videoPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+    else if (!explicitPath && exists(defaultHap)) g_hapPath = defaultHap;
+    bool haveVideo = exists(g_videoPath);
     if (g_hapPath.empty() && !haveVideo) {
-        MessageBoxW(nullptr, (L"No se encontro el video:\n" + g_videoPath +
-                              L"\n\nPone fondo.hap o fondo.mp4 junto a HapWallpaper.exe (ver preparar_video.ps1).").c_str(),
+        MessageBoxW(nullptr, (L"Video not found:\n" + g_videoPath +
+                              L"\n\nPut wallpaper.hap or wallpaper.mp4 next to HapWallpaper.exe (see prepare_video.ps1).").c_str(),
                     L"HapWallpaper", MB_ICONERROR);
         return 1;
     }

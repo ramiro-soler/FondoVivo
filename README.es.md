@@ -35,36 +35,36 @@ La contra: un archivo HAP es grande (~1,8 MB por cuadro a 1440p, ~1 GB para 18 s
 - **Todos los monitores**, cada uno con su ventana y su propia pausa. Un mismo archivo HAP llena cualquier resolución y proporción (se escala y recorta al centro en la placa).
 - **Pausa automática** con ventanas maximizadas o a pantalla completa, juegos en pantalla completa exclusiva, sesión bloqueada o pantalla apagada. Antes de pausarse siempre muestra un cuadro, así la barra nunca queda en negro.
 - **Barra de tareas transparente** (opcional, ver la nota de abajo).
-- **Respaldo con video común:** sin `.hap`, reproduce `fondo.mp4` (H.264, AV1…) con Media Foundation y decodificación por hardware.
+- **Respaldo con video común:** sin `.hap`, reproduce `wallpaper.mp4` (H.264, AV1…) con Media Foundation y decodificación por hardware.
 - Ícono en la bandeja (doble clic pausa/reanuda, y avisa si el `.hap` no se puede usar) y arranque con Windows.
 
 ## Preparar el video
 
-Lo más complicado de HAP es armar el archivo, así que `preparar_video.ps1` lo hace en un paso con [ffmpeg](https://ffmpeg.org/) (si no lo tenés: `winget install --id Gyan.FFmpeg -e`):
+Lo más complicado de HAP es armar el archivo, así que `prepare_video.ps1` lo hace en un paso con [ffmpeg](https://ffmpeg.org/) (si no lo tenés: `winget install --id Gyan.FFmpeg -e`):
 
 ```powershell
-.\preparar_video.ps1 -Video C:\videos\mi_fondo.mp4
+.\prepare_video.ps1 -Video C:\videos\mi_wallpaper.mp4
 ```
 
-Detecta la resolución del monitor principal, escala y recorta el video para llenarlo, lo pasa a 30 fps, genera `fondo.hap` junto al script, lo verifica y avisa cuánto va a ocupar.
+Detecta la resolución del monitor principal, escala y recorta el video para llenarlo, lo pasa a 30 fps, genera `wallpaper.hap` junto al script, lo verifica y avisa cuánto va a ocupar.
 
 | Opción | Para qué |
 |---|---|
-| `-Formato hap` / `av1` / `ambos` | `hap` = 0 % de decodificador, archivo grande. `av1` = `fondo.mp4` chico que usa el decodificador de la placa. `ambos` deja el MP4 de respaldo |
+| `-Format hap` / `av1` / `both` | `hap` = 0 % de decodificador, archivo grande. `av1` = `wallpaper.mp4` chico que usa el decodificador de la placa. `both` deja el MP4 de respaldo |
 | `-Fps 30` | Cuadros por segundo del archivo (el reproductor los lee). 60 duplica el tamaño |
-| `-Inicio 5 -Duracion 20` | Usar solo un tramo del video (en segundos). Menos duración = archivo más chico |
-| `-SombraReloj` | Oscurece suavemente la esquina del reloj y la bandeja para leerlos mejor con la barra transparente |
-| `-Ancho 1920 -Alto 1080` | Forzar una resolución (por ejemplo, la de tu monitor más grande) |
-| `-Salida C:\ruta` | Carpeta de salida (por defecto, la del script) |
+| `-Start 5 -Duration 20` | Usar solo un tramo del video (en segundos). Menos duración = archivo más chico |
+| `-ClockShadow` | Oscurece suavemente la esquina del reloj y la bandeja para leerlos mejor con la barra transparente |
+| `-Width 1920 -Height 1080` | Forzar una resolución (por ejemplo, la de tu monitor más grande) |
+| `-Output C:\ruta` | Carpeta de salida (por defecto, la del script) |
 
 Usá videos propios o que tengas permiso de usar. Los que hacen bucle sin corte se ven mejor.
 
 ## Uso
 
-Dejá `fondo.hap` (y/o `fondo.mp4`) junto a `HapWallpaper.exe` y abrilo. Si están los dos, usa el `.hap`.
+Dejá `wallpaper.hap` (y/o `wallpaper.mp4`) junto a `HapWallpaper.exe` y abrilo. Si están los dos, usa el `.hap`.
 
 ```
-HapWallpaper.exe [video.mp4 | fondo.hap] [--debug] [--nopause] [--notaskbar] [--noautostart]
+HapWallpaper.exe [video.mp4 | wallpaper.hap] [--debug] [--nopause] [--notaskbar] [--noautostart]
 ```
 
 | Opción | Efecto |
@@ -74,7 +74,7 @@ HapWallpaper.exe [video.mp4 | fondo.hap] [--debug] [--nopause] [--notaskbar] [--
 | `--notaskbar` | No toca la barra de tareas (no se carga la DLL) |
 | `--noautostart` | No se anota en el inicio de Windows |
 
-Para cerrarlo: clic derecho en el ícono de la bandeja → Salir.
+Para cerrarlo: clic derecho en el ícono de la bandeja → Exit.
 
 ### Sobre la DLL de la barra
 
@@ -92,6 +92,6 @@ g++ -O2 -s -shared -static -municode -o HapWallpaperTB.dll hapwallpaper_tb.cpp -
 ## Créditos y licencia
 
 - [HAP](https://hap.video/) — formato abierto creado por Tom Butterworth para Vidvox.
-- [ffmpeg](https://ffmpeg.org/) — codificador HAP usado por `preparar_video.ps1`.
+- [ffmpeg](https://ffmpeg.org/) — codificador HAP usado por `prepare_video.ps1`.
 
 Código bajo licencia [MIT](LICENSE). No incluye videos.

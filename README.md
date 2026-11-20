@@ -35,48 +35,48 @@ The trade-off: a HAP file is large (~1.8 MB per frame at 1440p, ~1 GB for 18 s a
 - **Every monitor**, each with its own window and its own pause state. One HAP file fills any resolution and aspect ratio (scaled and center-cropped on the GPU).
 - **Automatic pause** with maximized or fullscreen windows, exclusive-fullscreen games, a locked session or the display off. It always shows a frame before pausing, so the taskbar never turns black.
 - **Transparent taskbar** (optional, see the note below).
-- **Fallback to regular video**: without a `.hap`, it plays `fondo.mp4` (H.264, AV1…) through Media Foundation with hardware decoding.
+- **Fallback to regular video**: without a `.hap`, it plays `wallpaper.mp4` (H.264, AV1…) through Media Foundation with hardware decoding.
 - Tray icon (double-click pauses/resumes, with a warning if the `.hap` can't be used) and start with Windows.
 
 ## Prepare your video
 
-The hard part of HAP is making the file, so `preparar_video.ps1` does it in one step with [ffmpeg](https://ffmpeg.org/) (`winget install --id Gyan.FFmpeg -e` if you don't have it):
+The hard part of HAP is making the file, so `prepare_video.ps1` does it in one step with [ffmpeg](https://ffmpeg.org/) (`winget install --id Gyan.FFmpeg -e` if you don't have it):
 
 ```powershell
-.\preparar_video.ps1 -Video C:\videos\my_wallpaper.mp4
+.\prepare_video.ps1 -Video C:\videos\my_wallpaper.mp4
 ```
 
-It detects your primary monitor's resolution, scales and crops the video to fill it, converts it to 30 fps, writes `fondo.hap` next to the script, checks the result and tells you how much disk it will use.
+It detects your primary monitor's resolution, scales and crops the video to fill it, converts it to 30 fps, writes `wallpaper.hap` next to the script, checks the result and tells you how much disk it will use.
 
 | Option | What for |
 |---|---|
-| `-Formato hap` / `av1` / `ambos` | `hap` = 0 % decoder, large file. `av1` = small `fondo.mp4` that uses the GPU decoder. `ambos` (both) keeps the MP4 as a fallback |
+| `-Format hap` / `av1` / `both` | `hap` = 0 % decoder, large file. `av1` = small `wallpaper.mp4` that uses the GPU decoder. `both` keeps the MP4 as a fallback |
 | `-Fps 30` | Frame rate stored in the file (the player reads it). 60 doubles the size |
-| `-Inicio 5 -Duracion 20` | Use only part of the video (seconds). Shorter = smaller file |
-| `-SombraReloj` | Softly darkens the clock/tray corner so it reads better over a transparent taskbar |
-| `-Ancho 1920 -Alto 1080` | Force a resolution (e.g. your largest monitor) |
-| `-Salida C:\path` | Output folder (default: the script's folder) |
+| `-Start 5 -Duration 20` | Use only part of the video (seconds). Shorter = smaller file |
+| `-ClockShadow` | Softly darkens the clock/tray corner so it reads better over a transparent taskbar |
+| `-Width 1920 -Height 1080` | Force a resolution (e.g. your largest monitor) |
+| `-Output C:\path` | Output folder (default: the script's folder) |
 
 Use videos you made or have permission to use. Seamless loops look best.
 
 <details>
 <summary>File format / doing it by hand</summary>
 
-`fondo.hap` is the stream of HAP packets (DXT1, no Snappy) written by `ffmpeg -f rawvideo` (width and height multiples of 4):
+`wallpaper.hap` is the stream of HAP packets (DXT1, no Snappy) written by `ffmpeg -f rawvideo` (width and height multiples of 4):
 
 ```powershell
-ffmpeg -i video.mp4 -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,fps=30" -pix_fmt rgba -c:v hap -format hap -compressor none -f rawvideo fondo.hap
+ffmpeg -i video.mp4 -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,fps=30" -pix_fmt rgba -c:v hap -format hap -compressor none -f rawvideo wallpaper.hap
 ```
 
-`preparar_video.ps1` then appends a 32-byte trailer: `HAPWALL1` followed by six 32-bit integers (width, height, fps numerator, fps denominator, frame count, bytes per frame). Without the trailer the player assumes 30 fps and the primary monitor's resolution.
+`prepare_video.ps1` then appends a 32-byte trailer: `HAPWALL1` followed by six 32-bit integers (width, height, fps numerator, fps denominator, frame count, bytes per frame). Without the trailer the player assumes 30 fps and the primary monitor's resolution.
 </details>
 
 ## Use
 
-Put `fondo.hap` (and/or `fondo.mp4`) next to `HapWallpaper.exe` and run it. If both exist, the `.hap` wins.
+Put `wallpaper.hap` (and/or `wallpaper.mp4`) next to `HapWallpaper.exe` and run it. If both exist, the `.hap` wins.
 
 ```
-HapWallpaper.exe [video.mp4 | fondo.hap] [--debug] [--nopause] [--notaskbar] [--noautostart]
+HapWallpaper.exe [video.mp4 | wallpaper.hap] [--debug] [--nopause] [--notaskbar] [--noautostart]
 ```
 
 | Option | Effect |
@@ -86,7 +86,7 @@ HapWallpaper.exe [video.mp4 | fondo.hap] [--debug] [--nopause] [--notaskbar] [--
 | `--notaskbar` | Leaves the taskbar alone (the DLL is not loaded) |
 | `--noautostart` | Doesn't register itself to start with Windows |
 
-To quit: right-click the tray icon → Salir.
+To quit: right-click the tray icon → Exit.
 
 ### About the taskbar DLL
 
@@ -104,6 +104,6 @@ g++ -O2 -s -shared -static -municode -o HapWallpaperTB.dll hapwallpaper_tb.cpp -
 ## Credits and license
 
 - [HAP](https://hap.video/) — open format created by Tom Butterworth for Vidvox.
-- [ffmpeg](https://ffmpeg.org/) — HAP encoder used by `preparar_video.ps1`.
+- [ffmpeg](https://ffmpeg.org/) — HAP encoder used by `prepare_video.ps1`.
 
 Code under the [MIT](LICENSE) license. No videos included.
