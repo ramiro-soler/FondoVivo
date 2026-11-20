@@ -1,12 +1,14 @@
-// HapWallpaper - fondo de pantalla animado ultraliviano.
-// Reproduce un video en bucle detras de los iconos del escritorio usando
-// Media Foundation (decodificacion por GPU). Se pausa solo cuando una ventana
-// maximizada / a pantalla completa tapa el escritorio, al bloquear la sesion
-// o con la pantalla apagada.
+// HapWallpaper - fondo de pantalla animado ultraliviano para Windows 11.
+// Reproduce un video en bucle detras de los iconos del escritorio, en todos los
+// monitores. Con un archivo HAP (cuadros BC1) no usa el decodificador de video: la
+// placa lee los cuadros tal cual. Sin HAP usa Media Foundation (decodificacion por
+// hardware). Presenta en cada refresco del monitor para que G-Sync/FreeSync no baje la
+// frecuencia, y se pausa por monitor con ventanas maximizadas o a pantalla completa,
+// con la sesion bloqueada o con la pantalla apagada.
 //
 // Uso: HapWallpaper.exe [ruta_video|ruta.hap] [--debug] [--nopause] [--notaskbar] [--noautostart]
-//   Sin ruta usa "fondo.hap" junto al .exe si existe (cuadros BC1, sin decodificador de
-//   video) y si no "fondo.mp4" (Media Foundation). --debug escribe log.txt junto al .exe.
+//   Sin ruta usa "fondo.hap" junto al .exe si existe y si no "fondo.mp4".
+//   --debug escribe log.txt junto al .exe (y tb_log.txt la DLL de la barra).
 
 #ifndef UNICODE
 #define UNICODE
@@ -26,6 +28,7 @@
 #include <shlobj.h>
 #include <wtsapi32.h>
 #include <string>
+#include <vector>
 #include <cstdio>
 #include <cwchar>
 
@@ -46,24 +49,15 @@ DEFINE_GUID(FV_GUID_CONSOLE_DISPLAY_STATE, 0x6fe69556, 0x704a, 0x47a0, 0x8f, 0x2
 #define IDM_EXIT 101
 
 static HINSTANCE g_inst;
-static HWND g_msgWnd, g_videoWnd;
-static IMFMediaEngine* g_engine;
+static HWND g_msgWnd;
 static ID3D11Device* g_d3d;
 static IMFDXGIDeviceManager* g_dxgiMgr;
 static UINT g_resetToken;
+static CRITICAL_SECTION g_ctxLock; // el contexto inmediato se comparte entre los hilos de cada monitor
 static std::wstring g_videoPath, g_exeDir;
-static bool g_debug, g_noAutostart, g_noAutoPause, g_userPaused, g_autoPaused, g_locked, g_displayOff;
+static bool g_debug, g_noAutostart, g_noAutoPause, g_userPaused, g_fullscreenApp, g_locked, g_displayOff;
 static UINT WM_TASKBARCREATED;
 static NOTIFYICONDATAW g_nid;
-
-// Modo "frame server": el motor decodifica a la velocidad del video (60 fps) y un
-// hilo propio presenta el ultimo cuadro en cada refresco del monitor (200 Hz).
-// Asi G-Sync se queda en 200 Hz sin decodificar 200 cuadros por segundo.
-static IDXGISwapChain1* g_swap;
-static ID3D11Texture2D* g_frameTex;
-static HANDLE g_frameWait, g_runEvent, g_rtThread;
-static volatile LONG g_rtStop;
-static UINT g_vidW, g_vidH;
 
 static void Log(const wchar_t* fmt, ...) {
     if (!g_debug) return;
@@ -74,6 +68,45 @@ static void Log(const wchar_t* fmt, ...) {
     va_list ap; va_start(ap, fmt); vfwprintf(f, fmt, ap); va_end(ap);
     fputwc(L'\n', f);
     fclose(f);
+}
+
+static void Balloon(const wchar_t* title, const wchar_t* text) {
+    NOTIFYICONDATAW n = g_nid;
+    n.uFlags = NIF_INFO;
+    wcsncpy(n.szInfoTitle, title, 63);
+    wcsncpy(n.szInfo, text, 255);
+    n.dwInfoFlags = NIIF_WARNING;
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+// ------------------------------------------------------------------ Un monitor
+// Cada monitor tiene su ventana dentro de WorkerW, su swap chain y su hilo de render.
+// El hilo presenta en cada refresco del monitor: G-Sync se queda a la frecuencia
+// maxima aunque el video sea de 30 fps. En los refrescos en los que el cuadro no cambio
+// no dibuja nada y le pasa a Windows un rectangulo sucio minimo.
+struct Screen {
+    HMONITOR mon = nullptr;
+    RECT full = {}, work = {};
+    HWND wnd = nullptr;
+    IMFMediaEngine* engine = nullptr;      // solo en modo video
+    bool engineOwnsWindow = false;          // sin D3D11: el motor dibuja en la ventana
+    IDXGISwapChain1* swap = nullptr;
+    HANDLE frameWait = nullptr, runEvent = nullptr, thread = nullptr;
+    volatile LONG stop = 0;
+    volatile bool shown = false;            // ya mostro al menos un cuadro
+    bool autoPaused = false;
+    ID3D11Texture2D* hapTex = nullptr;      // modo HAP: cuadro BC1 de este monitor
+    ID3D11ShaderResourceView* hapSrv = nullptr;
+    ID3D11Buffer* cb = nullptr;             // recorte para llenar la pantalla
+};
+static std::vector<Screen*> g_screens;
+
+// Rectangulo del video (0..1) que llena la pantalla sin bordes, recortando al centro.
+static void CoverRect(float vw, float vh, float sw, float sh, float out[4] /*x0,y0,x1,y1*/) {
+    float va = vw / vh, sa = sw / sh;
+    out[0] = 0; out[1] = 0; out[2] = 1; out[3] = 1;
+    if (va > sa) { float s = sa / va; out[0] = (1 - s) / 2; out[2] = out[0] + s; }
+    else if (va < sa) { float s = va / sa; out[1] = (1 - s) / 2; out[3] = out[1] + s; }
 }
 
 // ---------------------------------------------------------------- Media Engine
@@ -107,11 +140,11 @@ static void InitD3D() {
         g_dxgiMgr->ResetDevice(g_d3d, g_resetToken);
 }
 
-static bool CreateEngine(HWND hwnd, bool useDxgi) {
+static IMFMediaEngine* CreateEngine(HWND hwnd, bool useDxgi) {
     IMFMediaEngineClassFactory* factory = nullptr;
     HRESULT hr = CoCreateInstance(FV_CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_INPROC_SERVER,
                                   FV_IID_IMFMediaEngineClassFactory, (void**)&factory);
-    if (FAILED(hr)) { Log(L"No se pudo crear la fabrica: 0x%08X", (unsigned)hr); return false; }
+    if (FAILED(hr)) { Log(L"No se pudo crear la fabrica: 0x%08X", (unsigned)hr); return nullptr; }
     IMFAttributes* attr = nullptr;
     MFCreateAttributes(&attr, 4);
     Notify* notify = new Notify();
@@ -120,208 +153,241 @@ static bool CreateEngine(HWND hwnd, bool useDxgi) {
     if (useDxgi && g_dxgiMgr) attr->SetUnknown(FV_MF_MEDIA_ENGINE_DXGI_MANAGER, g_dxgiMgr);
     else attr->SetUINT64(FV_MF_MEDIA_ENGINE_PLAYBACK_HWND, (UINT64)(ULONG_PTR)hwnd);
     attr->SetUINT32(FV_MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, 87 /* DXGI_FORMAT_B8G8R8A8_UNORM */);
-    hr = factory->CreateInstance(0, attr, &g_engine);
+    IMFMediaEngine* engine = nullptr;
+    hr = factory->CreateInstance(0, attr, &engine);
     notify->Release(); attr->Release(); factory->Release();
-    if (FAILED(hr)) { Log(L"CreateInstance fallo (dxgi=%d): 0x%08X", useDxgi, (unsigned)hr); g_engine = nullptr; return false; }
-
-    g_engine->SetMuted(TRUE);
-    g_engine->SetLoop(TRUE);
-    g_engine->SetAutoPlay(TRUE);
+    if (FAILED(hr)) { Log(L"CreateInstance fallo (dxgi=%d): 0x%08X", useDxgi, (unsigned)hr); return nullptr; }
+    engine->SetMuted(TRUE);
+    engine->SetLoop(TRUE);
+    engine->SetAutoPlay(TRUE);
     BSTR src = SysAllocString(g_videoPath.c_str());
-    hr = g_engine->SetSource(src);
+    hr = engine->SetSource(src);
     SysFreeString(src);
     if (FAILED(hr)) Log(L"SetSource fallo: 0x%08X", (unsigned)hr);
-    g_engine->Play();
-    Log(L"Motor creado (dxgi=%d)", useDxgi);
-    return true;
+    engine->Play();
+    return engine;
 }
 
 // ------------------------------------------------- Modo HAP (cuadros ya comprimidos)
 // fondo.hap: cuadros DXT1/BC1 de HAP sin compresion extra (ffmpeg -c:v hap -compressor
 // none -f rawvideo). La placa lee BC1 directamente: no se usa el decodificador de video,
-// solo se sube el cuadro (1,8 MB) y se dibuja con un shader minimo.
+// solo se sube el cuadro y se dibuja con un shader que lo escala para llenar cada monitor.
 // Al final del archivo, preparar_video.ps1 agrega un bloque de 32 bytes con los datos
-// del video (sin el bloque se asume 30 fps, como los primeros archivos).
+// del video. Sin el bloque se asume 30 fps y la resolucion del monitor principal.
 #pragma pack(push, 1)
 struct HapTrailer { char magic[8]; UINT width, height, fpsNum, fpsDen, frames, stride; };
 #pragma pack(pop)
 static const char kHapMagic[8] = { 'H', 'A', 'P', 'W', 'A', 'L', 'L', '1' };
 static std::wstring g_hapPath;
 static HANDLE g_hapFile, g_hapMap;
-static bool g_hapReady; // archivo validado; cada hilo de render mapea y suelta su propia vista
+static bool g_hapReady; // archivo validado; cada hilo mapea y suelta su propia vista
 static UINT g_hapFrames, g_hapStride, g_hapHdr, g_hapW, g_hapH, g_hapFpsNum = 30, g_hapFpsDen = 1;
-static ID3D11Texture2D* g_hapTex;
-static ID3D11ShaderResourceView* g_hapSrv;
 static ID3D11VertexShader* g_vs;
 static ID3D11PixelShader* g_ps;
+static ID3D11SamplerState* g_sampler;
 
 typedef HRESULT (WINAPI *PFN_D3DCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
 
-static bool InitHap(UINT w, UINT h) {
-    if (g_hapReady && g_hapW == w && g_hapH == h) return true;
-    if (g_hapReady) return false;
+static void CloseHap() {
+    if (g_hapMap) CloseHandle(g_hapMap);
+    if (g_hapFile) CloseHandle(g_hapFile);
+    g_hapMap = g_hapFile = nullptr;
+    g_hapReady = false;
+}
+
+static bool InitHap() {
+    if (g_hapReady) return true;
+    if (g_hapPath.empty() || !g_d3d) return false;
     g_hapFile = CreateFileW(g_hapPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (g_hapFile == INVALID_HANDLE_VALUE) { g_hapFile = nullptr; return false; }
     LARGE_INTEGER size; GetFileSizeEx(g_hapFile, &size);
     g_hapMap = CreateFileMappingW(g_hapFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
     // Vista temporal solo para validar; se suelta antes de reproducir.
     const BYTE* p = g_hapMap ? (const BYTE*)MapViewOfFile(g_hapMap, FILE_MAP_READ, 0, 0, 0) : nullptr;
-    UINT payload = w * h / 2;
-    bool ok = p && size.QuadPart > 8 && (p[3] & 0x0F) == 0x0B && (p[3] & 0xF0) == 0xA0; // DXT1, sin Snappy
+    bool ok = p && size.QuadPart > 40 && (p[3] & 0x0F) == 0x0B && (p[3] & 0xF0) == 0xA0; // DXT1, sin Snappy
     if (ok) {
         UINT s24 = p[0] | (p[1] << 8) | (p[2] << 16);
         g_hapHdr = s24 ? 4 : 8;
-        UINT s = s24 ? s24 : *(const UINT*)(p + 4);
-        g_hapStride = g_hapHdr + payload;
+        UINT payload = s24 ? s24 : *(const UINT*)(p + 4);
         LONGLONG data = size.QuadPart;
-        const HapTrailer* t = size.QuadPart >= (LONGLONG)sizeof(HapTrailer)
-            ? (const HapTrailer*)(p + size.QuadPart - sizeof(HapTrailer)) : nullptr;
-        if (t && !memcmp(t->magic, kHapMagic, 8)) {
+        const HapTrailer* t = (const HapTrailer*)(p + size.QuadPart - sizeof(HapTrailer));
+        if (!memcmp(t->magic, kHapMagic, 8)) {
             data -= sizeof(HapTrailer);
-            ok = t->width == w && t->height == h && t->stride == g_hapStride && t->fpsNum && t->fpsDen &&
-                 (LONGLONG)t->frames * g_hapStride == data;
-            if (ok) { g_hapFpsNum = t->fpsNum; g_hapFpsDen = t->fpsDen; }
+            g_hapW = t->width; g_hapH = t->height;
+            g_hapFpsNum = t->fpsNum; g_hapFpsDen = t->fpsDen;
+            ok = t->fpsNum && t->fpsDen && t->stride == g_hapHdr + payload && (LONGLONG)t->frames * t->stride == data;
+        } else {
+            // Archivo sin bloque final: se asume la resolucion del monitor principal.
+            g_hapW = GetSystemMetrics(SM_CXSCREEN); g_hapH = GetSystemMetrics(SM_CYSCREEN);
+            g_hapFpsNum = 30; g_hapFpsDen = 1;
         }
-        ok = ok && s == payload && data % g_hapStride == 0;
+        g_hapStride = g_hapHdr + payload;
+        ok = ok && g_hapW % 4 == 0 && g_hapH % 4 == 0 && payload == g_hapW * g_hapH / 2 && data % g_hapStride == 0;
         g_hapFrames = ok ? (UINT)(data / g_hapStride) : 0;
     }
     if (p) UnmapViewOfFile(p);
-    if (!ok || !g_hapFrames) {
-        Log(L"El archivo HAP no coincide con la pantalla %ux%u; se usa el video", w, h);
-        if (g_hapMap) CloseHandle(g_hapMap);
-        CloseHandle(g_hapFile); g_hapMap = g_hapFile = nullptr;
-        g_hapPath.clear();
-        return false;
-    }
-    g_hapReady = true; g_hapW = w; g_hapH = h;
+    if (!ok || !g_hapFrames) { Log(L"Archivo HAP invalido: %ls", g_hapPath.c_str()); CloseHap(); return false; }
 
-    D3D11_TEXTURE2D_DESC td = {};
-    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_BC1_UNORM; td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    HRESULT hr = g_d3d->CreateTexture2D(&td, nullptr, &g_hapTex);
-    if (SUCCEEDED(hr)) hr = g_d3d->CreateShaderResourceView(g_hapTex, nullptr, &g_hapSrv);
-
-    static const char hlsl[] =
-        "Texture2D t : register(t0);\n"
-        "float4 vs(uint i : SV_VertexID) : SV_Position {\n"
-        "  float2 p = float2((i << 1) & 2, i & 2);\n"
-        "  return float4(p * float2(2, -2) + float2(-1, 1), 0, 1); }\n"
-        "float4 ps(float4 p : SV_Position) : SV_Target {\n"
-        "  return float4(t.Load(int3(p.xy, 0)).rgb, 1); }\n";
-    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
-    PFN_D3DCompile compile = dc ? (PFN_D3DCompile)GetProcAddress(dc, "D3DCompile") : nullptr;
-    ID3DBlob *vsb = nullptr, *psb = nullptr;
-    if (SUCCEEDED(hr) && compile) {
-        hr = compile(hlsl, sizeof(hlsl) - 1, nullptr, nullptr, nullptr, "vs", "vs_4_0", 0, 0, &vsb, nullptr);
+    HRESULT hr = S_OK;
+    if (!g_vs) {
+        // El triangulo cubre la pantalla; uv recorta el video para llenarla (cb).
+        static const char hlsl[] =
+            "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+            "cbuffer c : register(b0) { float4 r; };\n"
+            "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD; };\n"
+            "V vs(uint i : SV_VertexID) {\n"
+            "  float2 p = float2((i << 1) & 2, i & 2); V o;\n"
+            "  o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+            "  o.uv = r.xy + p * (r.zw - r.xy); return o; }\n"
+            "float4 ps(V i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n";
+        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        PFN_D3DCompile compile = dc ? (PFN_D3DCompile)GetProcAddress(dc, "D3DCompile") : nullptr;
+        ID3DBlob *vsb = nullptr, *psb = nullptr;
+        hr = compile ? S_OK : E_FAIL;
+        if (SUCCEEDED(hr)) hr = compile(hlsl, sizeof(hlsl) - 1, nullptr, nullptr, nullptr, "vs", "vs_4_0", 0, 0, &vsb, nullptr);
         if (SUCCEEDED(hr)) hr = compile(hlsl, sizeof(hlsl) - 1, nullptr, nullptr, nullptr, "ps", "ps_4_0", 0, 0, &psb, nullptr);
         if (SUCCEEDED(hr)) hr = g_d3d->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &g_vs);
         if (SUCCEEDED(hr)) hr = g_d3d->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &g_ps);
-    } else if (SUCCEEDED(hr)) hr = E_FAIL;
-    if (vsb) vsb->Release();
-    if (psb) psb->Release();
-    if (FAILED(hr)) { Log(L"No se pudo preparar HAP: 0x%08X", (unsigned)hr); g_hapPath.clear(); g_hapReady = false; return false; }
-    Log(L"HAP: %u cuadros %ux%u a %u/%u fps", g_hapFrames, w, h, g_hapFpsNum, g_hapFpsDen);
+        if (vsb) vsb->Release();
+        if (psb) psb->Release();
+        if (SUCCEEDED(hr)) {
+            D3D11_SAMPLER_DESC sd = {};
+            sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.MaxLOD = D3D11_FLOAT32_MAX;
+            hr = g_d3d->CreateSamplerState(&sd, &g_sampler);
+        }
+    }
+    if (FAILED(hr)) { Log(L"No se pudo preparar HAP: 0x%08X", (unsigned)hr); CloseHap(); return false; }
+    g_hapReady = true;
+    Log(L"HAP: %u cuadros %ux%u a %u/%u fps", g_hapFrames, g_hapW, g_hapH, g_hapFpsNum, g_hapFpsDen);
     return true;
 }
 
-// No pausar hasta haber mostrado al menos un cuadro (si no, detras de la barra queda negro).
-static volatile bool g_shown;
-static bool ShouldPause() { return (g_userPaused || g_autoPaused || g_locked || g_displayOff) && (g_shown || !g_swap); }
+static bool CreateHapResources(Screen* s, UINT sw, UINT sh) {
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = g_hapW; td.Height = g_hapH; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_BC1_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(g_d3d->CreateTexture2D(&td, nullptr, &s->hapTex))) return false;
+    if (FAILED(g_d3d->CreateShaderResourceView(s->hapTex, nullptr, &s->hapSrv))) return false;
+    float r[4]; CoverRect((float)g_hapW, (float)g_hapH, (float)sw, (float)sh, r);
+    D3D11_BUFFER_DESC bd = { 16, D3D11_USAGE_IMMUTABLE, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+    D3D11_SUBRESOURCE_DATA init = { r, 0, 0 };
+    return SUCCEEDED(g_d3d->CreateBuffer(&bd, &init, &s->cb));
+}
 
-static DWORD WINAPI RenderThread(LPVOID) {
+// --------------------------------------------------------------------- Render
+static bool ShouldPause(Screen* s) {
+    bool want = g_userPaused || s->autoPaused || g_fullscreenApp || g_locked || g_displayOff;
+    // No pausar hasta haber mostrado un cuadro (si no, detras de la barra queda negro).
+    return want && (s->shown || !s->swap);
+}
+
+static DWORD WINAPI RenderThread(LPVOID param) {
+    Screen* s = (Screen*)param;
     ID3D11DeviceContext* ctx = nullptr;
     g_d3d->GetImmediateContext(&ctx);
+    bool hap = g_hapReady && s->hapTex;
     bool waitNext = false, haveFrame = false;
     UINT64 frameVer = 0, bufVer[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
     IDXGISwapChain3* sc3 = nullptr;
-    g_swap->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&sc3);
+    s->swap->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&sc3);
+    DXGI_SWAP_CHAIN_DESC1 sd; s->swap->GetDesc1(&sd);
     LARGE_INTEGER qpf; QueryPerformanceFrequency(&qpf);
     LONGLONG hapLast = 0, hapAcc = 0;
     UINT hapCur = ~0u;
-    const BYTE* hapView = nullptr; // vista propia del archivo; se suelta al pausar
-    while (!g_rtStop) {
-        if (WaitForSingleObject(g_runEvent, 0) == WAIT_TIMEOUT) {
-            // En pausa (ventana maximizada, juego, pantalla apagada): soltar los ~1 GB
-            // de cuadros de la memoria del proceso hasta que vuelva a reproducirse.
+    const BYTE* hapView = nullptr;      // vista propia del archivo; se suelta al pausar
+    MFVideoNormalizedRect src = { 0, 0, 1, 1 };
+    bool srcReady = false;
+    while (!s->stop) {
+        if (WaitForSingleObject(s->runEvent, 0) == WAIT_TIMEOUT) {
+            // En pausa: soltar la vista del archivo HAP (~1 GB) hasta que vuelva a reproducirse.
             if (hapView) {
                 UnmapViewOfFile(hapView); hapView = nullptr;
                 SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
             }
-            WaitForSingleObject(g_runEvent, INFINITE);
+            hapLast = 0;
+            WaitForSingleObject(s->runEvent, INFINITE);
         }
-        if (g_rtStop) break;
-        if (g_hapReady && !hapView) {
+        if (s->stop) break;
+        if (hap && !hapView) {
             hapView = (const BYTE*)MapViewOfFile(g_hapMap, FILE_MAP_READ, 0, 0, 0);
             if (!hapView) { Sleep(100); continue; }
         }
         // Espera el proximo refresco (la cola del swap chain tiene lugar).
-        if (waitNext && WaitForSingleObject(g_frameWait, 100) != WAIT_OBJECT_0) { waitNext = false; continue; }
+        if (waitNext && WaitForSingleObject(s->frameWait, 100) != WAIT_OBJECT_0) { waitNext = false; continue; }
         waitNext = false;
-        LONGLONG pts;
-        bool hap = g_hapReady;
         if (hap) {
-            // Reloj propio: solo avanza mientras se reproduce (saltos de pausa recortados).
+            // Reloj propio: solo avanza mientras se reproduce.
             LARGE_INTEGER now; QueryPerformanceCounter(&now);
             if (hapLast) { LONGLONG dt = now.QuadPart - hapLast; if (dt > qpf.QuadPart / 20) dt = qpf.QuadPart / 20; hapAcc += dt; }
             hapLast = now.QuadPart;
             UINT f = (UINT)((hapAcc * (LONGLONG)g_hapFpsNum / (qpf.QuadPart * (LONGLONG)g_hapFpsDen)) % g_hapFrames);
             if (f != hapCur) {
-                ctx->UpdateSubresource(g_hapTex, 0, nullptr, hapView + (size_t)f * g_hapStride + g_hapHdr, (g_hapW / 4) * 8, 0);
+                EnterCriticalSection(&g_ctxLock);
+                ctx->UpdateSubresource(s->hapTex, 0, nullptr, hapView + (size_t)f * g_hapStride + g_hapHdr, (g_hapW / 4) * 8, 0);
+                LeaveCriticalSection(&g_ctxLock);
                 hapCur = f; frameVer++; haveFrame = true;
             }
-        } else if (!g_frameTex) {
-            // Primer cuadro: crear la textura al tamano real del video.
-            DWORD w = 0, h = 0;
-            if (FAILED(g_engine->GetNativeVideoSize(&w, &h)) || !w || !h) { Sleep(10); continue; }
-            D3D11_TEXTURE2D_DESC td = {};
-            td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
-            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
-            td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            if (FAILED(g_d3d->CreateTexture2D(&td, nullptr, &g_frameTex))) { Sleep(100); continue; }
-            g_vidW = w; g_vidH = h;
-            Log(L"Video %ux%u, presentando a la frecuencia del monitor", (unsigned)w, (unsigned)h);
+        } else {
+            if (!srcReady) {
+                DWORD vw = 0, vh = 0;
+                if (FAILED(s->engine->GetNativeVideoSize(&vw, &vh)) || !vw || !vh) { Sleep(10); continue; }
+                float r[4]; CoverRect((float)vw, (float)vh, (float)sd.Width, (float)sd.Height, r);
+                src = { r[0], r[1], r[2], r[3] };
+                srcReady = true;
+                Log(L"Video %ux%u en monitor %ux%u", (unsigned)vw, (unsigned)vh, sd.Width, sd.Height);
+            }
+            LONGLONG pts;
+            if (s->engine->OnVideoStreamTick(&pts) == S_OK) { haveFrame = true; frameVer++; }
         }
-        if (!hap && g_engine->OnVideoStreamTick(&pts) == S_OK) { haveFrame = true; frameVer++; }
         if (!haveFrame) { Sleep(2); continue; }
-        // El cuadro se convierte directo en el buffer del swap chain, y solo cuando ese
-        // buffer tiene un cuadro viejo (una vez por buffer por cuadro de video, sin
-        // copias intermedias). En los refrescos repetidos se presenta sin dibujar nada y
-        // con un rectangulo sucio minimo: Windows casi no recompone, pero el monitor
-        // sigue a 200 Hz.
+        // Cada buffer del swap chain se redibuja solo cuando tiene un cuadro viejo (una vez
+        // por buffer por cuadro de video, sin copias intermedias).
         UINT idx = sc3 ? sc3->GetCurrentBackBufferIndex() : 0;
         if (idx > 3) idx = 0;
-        bool copied = false;
+        bool drawn = false;
         if (!sc3 || bufVer[idx] != frameVer) {
             ID3D11Texture2D* back = nullptr;
-            if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back))) {
-                DXGI_SWAP_CHAIN_DESC1 sd; g_swap->GetDesc1(&sd);
+            if (SUCCEEDED(s->swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back))) {
                 if (hap) {
                     ID3D11RenderTargetView* rtv = nullptr;
                     if (SUCCEEDED(g_d3d->CreateRenderTargetView(back, nullptr, &rtv))) {
                         D3D11_VIEWPORT vp = { 0, 0, (float)sd.Width, (float)sd.Height, 0, 1 };
+                        EnterCriticalSection(&g_ctxLock);
                         ctx->OMSetRenderTargets(1, &rtv, nullptr);
                         ctx->RSSetViewports(1, &vp);
                         ctx->IASetInputLayout(nullptr);
                         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                         ctx->VSSetShader(g_vs, nullptr, 0);
+                        ctx->VSSetConstantBuffers(0, 1, &s->cb);
                         ctx->PSSetShader(g_ps, nullptr, 0);
-                        ctx->PSSetShaderResources(0, 1, &g_hapSrv);
+                        ctx->PSSetShaderResources(0, 1, &s->hapSrv);
+                        ctx->PSSetSamplers(0, 1, &g_sampler);
                         ctx->Draw(3, 0);
+                        ID3D11RenderTargetView* none = nullptr;
+                        ctx->OMSetRenderTargets(1, &none, nullptr);
+                        LeaveCriticalSection(&g_ctxLock);
                         rtv->Release();
-                        bufVer[idx] = frameVer; copied = true;
+                        drawn = true;
                     }
                 } else {
                     RECT dst = { 0, 0, (LONG)sd.Width, (LONG)sd.Height };
-                    if (SUCCEEDED(g_engine->TransferVideoFrame(back, nullptr, &dst, nullptr))) { bufVer[idx] = frameVer; copied = true; }
+                    EnterCriticalSection(&g_ctxLock);
+                    drawn = SUCCEEDED(s->engine->TransferVideoFrame(back, &src, &dst, nullptr));
+                    LeaveCriticalSection(&g_ctxLock);
                 }
+                if (drawn) bufVer[idx] = frameVer;
                 back->Release();
             }
         }
+        // En los refrescos repetidos se presenta con un rectangulo sucio minimo: Windows
+        // casi no recompone, pero el monitor sigue a su frecuencia maxima.
         RECT tiny = { 0, 0, 1, 1 };
         DXGI_PRESENT_PARAMETERS pp = {};
-        if (!copied && sc3) { pp.DirtyRectsCount = 1; pp.pDirtyRects = &tiny; }
-        if (SUCCEEDED(g_swap->Present1(1, 0, &pp))) { waitNext = true; g_shown = true; }
+        if (!drawn && sc3) { pp.DirtyRectsCount = 1; pp.pDirtyRects = &tiny; }
+        if (SUCCEEDED(s->swap->Present1(1, 0, &pp))) { waitNext = true; s->shown = true; }
         else Sleep(5);
     }
     if (hapView) UnmapViewOfFile(hapView);
@@ -330,21 +396,8 @@ static DWORD WINAPI RenderThread(LPVOID) {
     return 0;
 }
 
-static void StopRender() {
-    if (g_rtThread) {
-        InterlockedExchange(&g_rtStop, 1);
-        SetEvent(g_runEvent);
-        WaitForSingleObject(g_rtThread, 2000);
-        CloseHandle(g_rtThread); g_rtThread = nullptr;
-    }
-    g_shown = false;
-    if (g_frameTex) { g_frameTex->Release(); g_frameTex = nullptr; }
-    if (g_swap) { g_swap->Release(); g_swap = nullptr; }
-    if (g_frameWait) { CloseHandle(g_frameWait); g_frameWait = nullptr; }
-}
-
-static bool StartRender(HWND hwnd) {
-    RECT rc; GetClientRect(hwnd, &rc);
+static bool StartRender(Screen* s) {
+    RECT rc; GetClientRect(s->wnd, &rc);
     IDXGIDevice* dxdev = nullptr; IDXGIAdapter* adapter = nullptr; IDXGIFactory2* factory = nullptr;
     g_d3d->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxdev);
     if (dxdev) dxdev->GetAdapter(&adapter);
@@ -356,30 +409,46 @@ static bool StartRender(HWND hwnd) {
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL; // conserva el contenido de cada buffer
     sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-    HRESULT hr = factory ? factory->CreateSwapChainForHwnd(g_d3d, hwnd, &sd, nullptr, nullptr, &g_swap) : E_FAIL;
-    if (factory) factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+    HRESULT hr = factory ? factory->CreateSwapChainForHwnd(g_d3d, s->wnd, &sd, nullptr, nullptr, &s->swap) : E_FAIL;
+    if (factory) factory->MakeWindowAssociation(s->wnd, DXGI_MWA_NO_ALT_ENTER);
     if (factory) factory->Release();
     if (adapter) adapter->Release();
     if (dxdev) dxdev->Release();
-    if (FAILED(hr)) { Log(L"No se pudo crear el swap chain: 0x%08X", (unsigned)hr); g_swap = nullptr; return false; }
+    if (FAILED(hr)) { Log(L"No se pudo crear el swap chain: 0x%08X", (unsigned)hr); s->swap = nullptr; return false; }
     IDXGISwapChain2* sc2 = nullptr;
-    if (SUCCEEDED(g_swap->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2))) {
+    if (SUCCEEDED(s->swap->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2))) {
         sc2->SetMaximumFrameLatency(1);
-        g_frameWait = sc2->GetFrameLatencyWaitableObject();
+        s->frameWait = sc2->GetFrameLatencyWaitableObject();
         sc2->Release();
     }
-    if (!g_runEvent) g_runEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (ShouldPause()) ResetEvent(g_runEvent); else SetEvent(g_runEvent);
-    InterlockedExchange(&g_rtStop, 0);
-    g_rtThread = CreateThread(nullptr, 0, RenderThread, nullptr, 0, nullptr);
-    SetThreadPriority(g_rtThread, THREAD_PRIORITY_ABOVE_NORMAL);
-    Log(L"Presentacion propia %ldx%ld", rc.right, rc.bottom);
+    s->runEvent = CreateEventW(nullptr, TRUE, ShouldPause(s) ? FALSE : TRUE, nullptr);
+    s->stop = 0;
+    s->thread = CreateThread(nullptr, 0, RenderThread, s, 0, nullptr);
+    SetThreadPriority(s->thread, THREAD_PRIORITY_ABOVE_NORMAL);
     return true;
 }
 
-static void DestroyEngine() {
-    StopRender();
-    if (g_engine) { g_engine->Shutdown(); g_engine->Release(); g_engine = nullptr; }
+static void DestroyScreen(Screen* s) {
+    if (s->thread) {
+        InterlockedExchange(&s->stop, 1);
+        SetEvent(s->runEvent);
+        WaitForSingleObject(s->thread, 2000);
+        CloseHandle(s->thread);
+    }
+    if (s->runEvent) CloseHandle(s->runEvent);
+    if (s->frameWait) CloseHandle(s->frameWait);
+    if (s->swap) s->swap->Release();
+    if (s->hapSrv) s->hapSrv->Release();
+    if (s->hapTex) s->hapTex->Release();
+    if (s->cb) s->cb->Release();
+    if (s->engine) { s->engine->Shutdown(); s->engine->Release(); }
+    if (s->wnd && IsWindow(s->wnd)) { SetWindowLongPtrW(s->wnd, GWLP_USERDATA, 0); DestroyWindow(s->wnd); }
+    delete s;
+}
+
+static void DestroyScreens() {
+    for (Screen* s : g_screens) DestroyScreen(s);
+    g_screens.clear();
 }
 
 // ---------------------------------------------------------- Escritorio (WorkerW)
@@ -402,44 +471,63 @@ static HWND FindWorkerW() {
     return worker;
 }
 
-static RECT PrimaryMonitorRect() {
+static bool g_hapWarned;
+
+static void AttachScreen(HWND worker, HMONITOR mon) {
+    Screen* s = new Screen();
+    s->mon = mon;
     MONITORINFO mi = { sizeof(mi) };
-    GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
-    return mi.rcMonitor;
+    GetMonitorInfoW(mon, &mi);
+    s->full = mi.rcMonitor; s->work = mi.rcWork;
+    POINT pts[2] = { { mi.rcMonitor.left, mi.rcMonitor.top }, { mi.rcMonitor.right, mi.rcMonitor.bottom } };
+    MapWindowPoints(HWND_DESKTOP, worker, pts, 2);
+    s->wnd = CreateWindowExW(WS_EX_NOACTIVATE, L"HapWallpaperVideo", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                             pts[0].x, pts[0].y, pts[1].x - pts[0].x, pts[1].y - pts[0].y,
+                             worker, nullptr, g_inst, nullptr);
+    if (!s->wnd) { Log(L"No se pudo crear la ventana de video"); delete s; return; }
+    SetWindowLongPtrW(s->wnd, GWLP_USERDATA, (LONG_PTR)s);
+    g_screens.push_back(s);
+    RECT rc; GetClientRect(s->wnd, &rc);
+
+    bool ok = false;
+    if (g_hapReady) {
+        ok = CreateHapResources(s, rc.right, rc.bottom) && StartRender(s);
+        if (ok) Log(L"Monitor %ldx%ld: HAP (sin decodificador de video)", rc.right, rc.bottom);
+    }
+    if (!ok && g_dxgiMgr && GetFileAttributesW(g_videoPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        s->engine = CreateEngine(s->wnd, true);
+        ok = s->engine && StartRender(s);
+        if (ok) Log(L"Monitor %ldx%ld: video con Media Foundation", rc.right, rc.bottom);
+    }
+    if (!ok && !s->swap && GetFileAttributesW(g_videoPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (s->engine) { s->engine->Shutdown(); s->engine->Release(); }
+        s->engine = CreateEngine(s->wnd, false);
+        s->engineOwnsWindow = s->engine != nullptr;
+    }
+}
+
+static BOOL CALLBACK EnumMonProc(HMONITOR mon, HDC, LPRECT, LPARAM lp) {
+    AttachScreen((HWND)lp, mon);
+    return TRUE;
 }
 
 static void Attach() {
-    DestroyEngine();
-    if (g_videoWnd && IsWindow(g_videoWnd)) DestroyWindow(g_videoWnd);
-    g_videoWnd = nullptr;
-
+    DestroyScreens();
     HWND worker = FindWorkerW();
     if (!worker) { Log(L"No se encontro WorkerW"); return; }
-    RECT mon = PrimaryMonitorRect();
-    POINT pts[2] = { { mon.left, mon.top }, { mon.right, mon.bottom } };
-    MapWindowPoints(HWND_DESKTOP, worker, pts, 2);
-    g_videoWnd = CreateWindowExW(WS_EX_NOACTIVATE, L"HapWallpaperVideo", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-                                 pts[0].x, pts[0].y, pts[1].x - pts[0].x, pts[1].y - pts[0].y,
-                                 worker, nullptr, g_inst, nullptr);
-    if (!g_videoWnd) { Log(L"No se pudo crear la ventana de video"); return; }
     InitD3D();
-    bool ok = false;
-    if (!g_hapPath.empty() && g_d3d) {
-        RECT rc; GetClientRect(g_videoWnd, &rc);
-        ok = InitHap(rc.right, rc.bottom) && StartRender(g_videoWnd);
-        if (!ok) StopRender();
-        else Log(L"Reproduciendo HAP (sin decodificador de video)");
+    if (!g_hapPath.empty() && !InitHap() && !g_hapWarned) {
+        g_hapWarned = true;
+        bool mp4 = GetFileAttributesW(g_videoPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+        Balloon(L"HapWallpaper", mp4 ? L"No se pudo usar el archivo .hap; se reproduce el video MP4. Volve a generarlo con preparar_video.ps1."
+                                     : L"No se pudo usar el archivo .hap. Volve a generarlo con preparar_video.ps1.");
     }
-    if (!ok) {
-        ok = g_dxgiMgr && CreateEngine(g_videoWnd, true);
-        if (ok && !StartRender(g_videoWnd)) { DestroyEngine(); ok = false; }
-    }
-    if (!ok) CreateEngine(g_videoWnd, false);
-    Log(L"Adjuntado a WorkerW %p, rect %d,%d %dx%d", worker, pts[0].x, pts[0].y, pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+    EnumDisplayMonitors(nullptr, nullptr, EnumMonProc, (LPARAM)worker);
+    Log(L"Adjuntado a WorkerW %p, %u monitores", worker, (unsigned)g_screens.size());
 }
 
 // ------------------------------------------------------------- Auto-pausa
-struct CoverCtx { HMONITOR mon; RECT work; RECT full; HWND found; };
+struct CoverCtx { HMONITOR mon; RECT work; HWND found; };
 
 static BOOL CALLBACK CoverProc(HWND h, LPARAM lp) {
     CoverCtx* c = (CoverCtx*)lp;
@@ -455,55 +543,61 @@ static BOOL CALLBACK CoverProc(HWND h, LPARAM lp) {
     if (MonitorFromWindow(h, MONITOR_DEFAULTTONULL) != c->mon) return TRUE;
     RECT r;
     if (FAILED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)))) GetWindowRect(h, &r);
-    // Pausa con ventanas maximizadas o a pantalla completa: detras de la barra
-    // transparente queda el ultimo cuadro congelado.
+    // Pausa con ventanas maximizadas o a pantalla completa en ese monitor: detras de la
+    // barra transparente queda el ultimo cuadro congelado.
     bool covers = r.left <= c->work.left && r.top <= c->work.top && r.right >= c->work.right && r.bottom >= c->work.bottom;
     if (covers) { c->found = h; return FALSE; }
     return TRUE;
 }
 
-static HWND CoveringWindow() {
-    CoverCtx c = {};
-    c.mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
-    MONITORINFO mi = { sizeof(mi) };
-    GetMonitorInfoW(c.mon, &mi);
-    c.work = mi.rcWork; c.full = mi.rcMonitor;
+static HWND CoveringWindow(Screen* s) {
+    CoverCtx c = { s->mon, s->work, nullptr };
     EnumWindows(CoverProc, (LPARAM)&c);
     return c.found;
 }
 
 static bool FullscreenAppRunning() {
-    QUERY_USER_NOTIFICATION_STATE s;
-    if (FAILED(SHQueryUserNotificationState(&s))) return false;
+    QUERY_USER_NOTIFICATION_STATE st;
+    if (FAILED(SHQueryUserNotificationState(&st))) return false;
     // QUNS_BUSY no se usa: Windows lo reporta aunque no haya nada en pantalla completa.
-    return s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE;
+    return st == QUNS_RUNNING_D3D_FULL_SCREEN || st == QUNS_PRESENTATION_MODE;
 }
 
 static void UpdateTrayTip() {
-    bool paused = g_userPaused || g_autoPaused || g_locked || g_displayOff;
-    swprintf(g_nid.szTip, 128, L"HapWallpaper - %ls", g_userPaused ? L"pausado" : paused ? L"en pausa automatica" : L"reproduciendo");
+    unsigned playing = 0;
+    for (Screen* s : g_screens) if (!ShouldPause(s)) playing++;
+    if (g_userPaused) swprintf(g_nid.szTip, 128, L"HapWallpaper - pausado");
+    else swprintf(g_nid.szTip, 128, L"HapWallpaper - %u de %u monitores reproduciendo%ls", playing, (unsigned)g_screens.size(),
+                  g_hapReady ? L" (HAP)" : L"");
     g_nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
 static void ApplyState() {
-    bool pause = ShouldPause();
-    if (g_runEvent) { if (pause) ResetEvent(g_runEvent); else SetEvent(g_runEvent); }
-    if (g_engine) {
-        BOOL isPaused = g_engine->IsPaused();
-        if (pause && !isPaused) { g_engine->Pause(); Log(L"Pausa"); }
-        else if (!pause && isPaused) { g_engine->Play(); Log(L"Reproduciendo"); }
+    for (Screen* s : g_screens) {
+        bool pause = ShouldPause(s);
+        if (s->runEvent) { if (pause) ResetEvent(s->runEvent); else SetEvent(s->runEvent); }
+        if (s->engine) {
+            BOOL isPaused = s->engine->IsPaused();
+            if (pause && !isPaused) s->engine->Pause();
+            else if (!pause && isPaused) s->engine->Play();
+        }
     }
     UpdateTrayTip();
 }
 
 static void Check() {
-    if (!g_videoWnd || !IsWindow(g_videoWnd)) { Log(L"Ventana perdida, reintentando"); Attach(); }
-    HWND cover = CoveringWindow();
-    bool autoPause = !g_noAutoPause && (cover != nullptr || FullscreenAppRunning());
-    if (autoPause != g_autoPaused) {
-        if (cover) { wchar_t t[128] = {}, c[64] = {}; GetWindowTextW(cover, t, 128); GetClassNameW(cover, c, 64); Log(L"Tapado por [%ls] \"%ls\"", c, t); }
-        g_autoPaused = autoPause;
+    bool lost = g_screens.empty();
+    for (Screen* s : g_screens) if (!IsWindow(s->wnd)) lost = true;
+    if (lost) { Log(L"Ventanas perdidas, reintentando"); Attach(); }
+    g_fullscreenApp = !g_noAutoPause && FullscreenAppRunning();
+    for (Screen* s : g_screens) {
+        HWND cover = g_noAutoPause ? nullptr : CoveringWindow(s);
+        bool ap = cover != nullptr;
+        if (ap != s->autoPaused) {
+            if (cover) { wchar_t t[128] = {}, c[64] = {}; GetWindowTextW(cover, t, 128); GetClassNameW(cover, c, 64); Log(L"Monitor tapado por [%ls] \"%ls\"", c, t); }
+            s->autoPaused = ap;
+        }
     }
     ApplyState();
 }
@@ -640,17 +734,16 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return TRUE;
-    case WM_DISPLAYCHANGE: Attach(); ApplyState(); return 0;
+    case WM_DISPLAYCHANGE: Attach(); ApplyState(); return 0; // monitores o resolucion cambiaron
     case WM_ENDSESSION:
-        if (wp) { DestroyEngine(); }
+        if (wp) DestroyScreens();
         return 0;
     case WM_DESTROY:
         KillTimer(h, IDT_CHECK);
         if (g_tbHook) UnhookWindowsHookEx(g_tbHook);
         if (g_fgHook) UnhookWinEvent(g_fgHook);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
-        DestroyEngine();
-        if (g_videoWnd && IsWindow(g_videoWnd)) DestroyWindow(g_videoWnd);
+        DestroyScreens();
         RestoreDesktop();
         PostQuitMessage(0);
         return 0;
@@ -660,10 +753,10 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 static LRESULT CALLBACK VideoProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_ERASEBKGND) {
-        if (!g_engine) { RECT r; GetClientRect(h, &r); FillRect((HDC)wp, &r, (HBRUSH)GetStockObject(BLACK_BRUSH)); }
+        Screen* s = (Screen*)GetWindowLongPtrW(h, GWLP_USERDATA);
+        if (!s || (!s->swap && !s->engineOwnsWindow)) { RECT r; GetClientRect(h, &r); FillRect((HDC)wp, &r, (HBRUSH)GetStockObject(BLACK_BRUSH)); }
         return 1;
     }
-    if (msg == WM_DESTROY && h == g_videoWnd) { DestroyEngine(); g_videoWnd = nullptr; }
     return DefWindowProcW(h, msg, wp, lp);
 }
 
@@ -672,28 +765,36 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"HapWallpaper_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    InitializeCriticalSection(&g_ctxLock);
 
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     g_exeDir = exe; g_exeDir = g_exeDir.substr(0, g_exeDir.find_last_of(L'\\'));
     g_videoPath = g_exeDir + L"\\fondo.mp4";
+    bool explicitPath = false;
     int argc; wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; i < argc; i++) {
         if (!wcscmp(argv[i], L"--debug")) g_debug = true;
         else if (!wcscmp(argv[i], L"--nopause")) g_noAutoPause = true;
         else if (!wcscmp(argv[i], L"--notaskbar")) g_taskbar = false;
         else if (!wcscmp(argv[i], L"--noautostart")) g_noAutostart = true;
-        else g_videoPath = argv[i];
+        else { g_videoPath = argv[i]; explicitPath = true; }
     }
     LocalFree(argv);
+    // La DLL de la barra solo escribe tb_log.txt si existe este evento.
+    HANDLE debugEvent = g_debug ? CreateEventW(nullptr, TRUE, TRUE, L"Local\\HapWallpaperDebug") : nullptr;
+
     // fondo.hap junto al .exe (o un .hap pasado como argumento) tiene prioridad sobre el video.
     if (g_videoPath.size() > 4 && !_wcsicmp(g_videoPath.c_str() + g_videoPath.size() - 4, L".hap")) g_hapPath = g_videoPath;
-    else if (g_videoPath == g_exeDir + L"\\fondo.mp4" && GetFileAttributesW((g_exeDir + L"\\fondo.hap").c_str()) != INVALID_FILE_ATTRIBUTES)
+    else if (!explicitPath && GetFileAttributesW((g_exeDir + L"\\fondo.hap").c_str()) != INVALID_FILE_ATTRIBUTES)
         g_hapPath = g_exeDir + L"\\fondo.hap";
-    if (GetFileAttributesW(g_videoPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        MessageBoxW(nullptr, (L"No se encontro el video:\n" + g_videoPath).c_str(), L"HapWallpaper", MB_ICONERROR);
+    bool haveVideo = GetFileAttributesW(g_videoPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (g_hapPath.empty() && !haveVideo) {
+        MessageBoxW(nullptr, (L"No se encontro el video:\n" + g_videoPath +
+                              L"\n\nPone fondo.hap o fondo.mp4 junto a HapWallpaper.exe (ver preparar_video.ps1).").c_str(),
+                    L"HapWallpaper", MB_ICONERROR);
         return 1;
     }
-    Log(L"Inicio, video: %ls", g_videoPath.c_str());
+    Log(L"Inicio, hap: %ls, video: %ls", g_hapPath.empty() ? L"-" : g_hapPath.c_str(), haveVideo ? g_videoPath.c_str() : L"-");
 
     // Se anota solo en el inicio de Windows (HKCU\...\Run) con su ruta actual.
     if (!g_noAutostart) {
@@ -739,10 +840,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
 
     WTSUnRegisterSessionNotification(g_msgWnd);
+    CloseHap();
+    if (g_sampler) g_sampler->Release();
+    if (g_vs) g_vs->Release();
+    if (g_ps) g_ps->Release();
     if (g_dxgiMgr) g_dxgiMgr->Release();
     if (g_d3d) g_d3d->Release();
     MFShutdown();
     CoUninitialize();
+    if (debugEvent) CloseHandle(debugEvent);
     if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
     return 0;
 }

@@ -50,7 +50,7 @@ if (-not $Ancho -or -not $Alto) {
     $Ancho = [int]$vc.CurrentHorizontalResolution; $Alto = [int]$vc.CurrentVerticalResolution
     if (-not $Ancho) { Write-Host "No pude detectar la resolucion. Pasala con -Ancho y -Alto." -ForegroundColor Red; exit 1 }
 }
-if ($Ancho % 4 -or $Alto % 4) { Write-Host "Ancho y alto deben ser multiplos de 4 para HAP." -ForegroundColor Red; exit 1 }
+if ($Formato -ne 'av1' -and ($Ancho % 4 -or $Alto % 4)) { Write-Host "Ancho y alto deben ser multiplos de 4 para HAP." -ForegroundColor Red; exit 1 }
 
 # --- info del video de origen
 $probe = & (Join-Path (Split-Path $ffmpeg) 'ffprobe.exe') -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate:format=duration -of default=nw=1 $Video

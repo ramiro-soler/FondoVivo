@@ -25,7 +25,10 @@ static const IID FV_IID_IVisualTreeServiceCallback2 = { 0xbad9eb88, 0xae77, 0x43
 static LONG g_objects;
 
 static void Log(const wchar_t* fmt, ...) {
-    // Log junto a la DLL.
+    // Log junto a la DLL, solo si HapWallpaper.exe corre con --debug (crea este evento).
+    HANDLE dbg = OpenEventW(SYNCHRONIZE, FALSE, L"Local\\HapWallpaperDebug");
+    if (!dbg) return;
+    CloseHandle(dbg);
     wchar_t path[MAX_PATH];
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&Log, &self);

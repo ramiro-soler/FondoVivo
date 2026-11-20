@@ -1,107 +1,109 @@
 # HapWallpaper
 
-Fondo de pantalla animado para Windows 11 que reproduce video **HAP directamente con Direct3D 11**: los cuadros ya vienen en el formato de textura comprimida que la placa de video lee de forma nativa (BC1/DXT1), así que **no usa el decodificador de video ni un reproductor multimedia**.
+**English** · [Español](README.es.md)
 
-*Animated wallpaper for Windows 11 that plays HAP video straight through Direct3D 11 (BC1 textures): no video decoder, no general-purpose media player.*
+Animated wallpaper for Windows 11 that plays **HAP video straight through Direct3D 11**. Frames are stored in the compressed texture format the GPU reads natively (BC1/DXT1), so it uses **no video decoder and no media player**.
 
-## Qué tiene de distinto
+[**Download the latest release**](https://github.com/ramiro-soler/HapWallpaper/releases/latest) — one small `.exe`, no runtime to install.
 
-[HAP](https://hap.video/) no es nuevo: es un formato abierto de Vidvox pensado para reproducir video como texturas comprimidas por GPU, y se usa hace años en shows en vivo y software de VJ (Resolume, TouchDesigner, VDMX, etc.).
+## Why it's different
 
-Lo que aporta HapWallpaper es llevar esa ruta a un **fondo de escritorio de Windows**, sin depender de un reproductor generalista (mpv, VLC, navegador) como hacen otros programas de fondos animados:
+[HAP](https://hap.video/) isn't new: it's an open format by Vidvox for playing video as GPU-compressed textures, used for years in live shows and VJ software (Resolume, TouchDesigner, VDMX…).
 
-| | Fondo animado típico (mpv/VLC/navegador) | HapWallpaper |
+HapWallpaper brings that path to the **Windows desktop**, instead of relying on a general-purpose player (mpv, VLC, a browser or Media Foundation) like other wallpaper apps:
+
+| | Typical animated wallpaper | HapWallpaper |
 |---|---|---|
-| Decodificación | Decodificador de video de la placa (NVDEC, etc.) o CPU | Ninguna: el cuadro se copia tal cual a una textura BC1 |
-| Conversión de color | YUV → RGB en cada cuadro | No hace falta: BC1 ya es RGB |
-| Presentación | La que imponga el reproductor | Swap chain propio en el escritorio (WorkerW), sin copias intermedias |
-| Monitores G-Sync/FreeSync | Un video de 30/60 fps arrastra la pantalla a 30/60 Hz | Presenta en cada refresco; si el cuadro no cambió, no dibuja y le pasa a Windows un rectángulo sucio mínimo, así el monitor sigue a su frecuencia máxima |
-| En pausa | Varía | 0 % de GPU y suelta la memoria del archivo |
+| Decoding | GPU video decoder (NVDEC, VCN, Quick Sync) or CPU | **None**: the frame is copied as-is into a BC1 texture |
+| Color conversion | YUV → RGB every frame | Not needed: BC1 is already RGB |
+| High-refresh G-Sync / FreeSync monitors | A 30/60 fps video drags the panel down to 30/60 Hz | Presents on every refresh; when the frame didn't change it draws nothing and hands Windows a 1×1 dirty rect, so the monitor stays at its maximum rate |
+| Maximized or fullscreen windows | Often keeps playing (or stutters on resume) | Pauses **per monitor** instantly; the last frame stays visible behind a transparent taskbar |
+| Paused | Varies | 0 % GPU and the file is released from memory |
 
-Medido en una RTX 3060 con monitor 2560×1440 a 200 Hz y un video de 30 fps:
+Measured on an RTX 3060, 2560×1440 @ 200 Hz, 30 fps video:
 
-| | Video H.264 (Media Foundation) | Video AV1 (Media Foundation) | **HAP** |
+| | H.264 (Media Foundation) | AV1 (Media Foundation) | **HAP** |
 |---|---|---|---|
-| Decodificador de video | 28–44 % | 6–18 % | **0 %** |
-| CPU | 2,4 % | 0,4 % | 0,5 % |
-| Consumo de la placa (reposo: 18 W) | 22,2 W | 20,7 W | **19,95 W** |
+| GPU video decoder | 28–44 % | 6–18 % | **0 %** |
+| CPU | 2.4 % | 0.4 % | 0.5 % |
+| GPU board power (idle: 18 W) | 22.2 W | 20.7 W | **19.5–20 W** |
 
-Los porcentajes del Administrador de tareas se calculan sobre la placa a su velocidad mínima (210 MHz), por eso parecen altos para tan poco consumo real.
+The trade-off: a HAP file is large (~1.8 MB per frame at 1440p, ~1 GB for 18 s at 30 fps) and is memory-mapped while playing. If you prefer a small file, HapWallpaper also plays any MP4/AV1 Windows can decode, with the same presentation.
 
-## Otras funciones
+## Features
 
-- **Pausa automática** con ventanas maximizadas o a pantalla completa (juegos, videos), sesión bloqueada o pantalla apagada. Antes de pausarse siempre muestra un cuadro, así detrás de la barra transparente nunca queda negro.
-- **Barra de tareas transparente** (opcional): `HapWallpaperTB.dll` se carga en Explorer con la API de diagnóstico XAML (como TranslucentTB) y oculta el fondo de la barra.
-- **Respaldo con video común:** si no hay archivo HAP, reproduce cualquier video que Windows soporte (MP4 H.264, AV1, etc.) con Media Foundation y decodificación por hardware, con la misma presentación a frecuencia máxima.
-- Ícono en la bandeja (doble clic pausa/reanuda) y arranque automático con Windows.
+- **Every monitor**, each with its own window and its own pause state. One HAP file fills any resolution and aspect ratio (scaled and center-cropped on the GPU).
+- **Automatic pause** with maximized or fullscreen windows, exclusive-fullscreen games, a locked session or the display off. It always shows a frame before pausing, so the taskbar never turns black.
+- **Transparent taskbar** (optional, see the note below).
+- **Fallback to regular video**: without a `.hap`, it plays `fondo.mp4` (H.264, AV1…) through Media Foundation with hardware decoding.
+- Tray icon (double-click pauses/resumes, with a warning if the `.hap` can't be used) and start with Windows.
 
-## Preparar el video
+## Prepare your video
 
-Lo más complicado de usar HAP es preparar el archivo, así que `preparar_video.ps1` lo hace en un paso con [ffmpeg](https://ffmpeg.org/) (si no lo tenés: `winget install --id Gyan.FFmpeg -e`):
+The hard part of HAP is making the file, so `preparar_video.ps1` does it in one step with [ffmpeg](https://ffmpeg.org/) (`winget install --id Gyan.FFmpeg -e` if you don't have it):
 
 ```powershell
-.\preparar_video.ps1 -Video C:\videos\mi_fondo.mp4
+.\preparar_video.ps1 -Video C:\videos\my_wallpaper.mp4
 ```
 
-El script:
+It detects your primary monitor's resolution, scales and crops the video to fill it, converts it to 30 fps, writes `fondo.hap` next to the script, checks the result and tells you how much disk it will use.
 
-- detecta la resolución del monitor principal y escala/recorta el video para llenar la pantalla sin bordes;
-- lo pasa a 30 fps (cambialo con `-Fps`; el reproductor lee los fps del archivo);
-- genera `fondo.hap` junto al script, verifica que el reproductor lo pueda leer y le agrega un bloque final con resolución, fps y cantidad de cuadros;
-- avisa cuánto va a ocupar y si no hay espacio en el disco.
-
-| Opción | Para qué |
+| Option | What for |
 |---|---|
-| `-Formato hap` / `av1` / `ambos` | `hap` = 0 % de decodificador pero archivo grande (~1,8 MB por cuadro a 1440p). `av1` = `fondo.mp4` chico que usa el decodificador de la placa. `ambos` deja el MP4 como respaldo |
-| `-Fps 30` | Cuadros por segundo del archivo (30 alcanza para fondos lentos; 60 duplica el tamaño) |
-| `-Inicio 5 -Duracion 20` | Usar solo un tramo del video (en segundos). Menos duración = archivo más chico |
-| `-SombraReloj` | Oscurece suavemente la esquina del reloj y la bandeja, para leerlos mejor con la barra transparente |
-| `-Ancho 1920 -Alto 1080` | Forzar una resolución (si la detección falla o es para otra PC) |
-| `-Salida C:\ruta` | Carpeta de salida (por defecto, la del script) |
+| `-Formato hap` / `av1` / `ambos` | `hap` = 0 % decoder, large file. `av1` = small `fondo.mp4` that uses the GPU decoder. `ambos` (both) keeps the MP4 as a fallback |
+| `-Fps 30` | Frame rate stored in the file (the player reads it). 60 doubles the size |
+| `-Inicio 5 -Duracion 20` | Use only part of the video (seconds). Shorter = smaller file |
+| `-SombraReloj` | Softly darkens the clock/tray corner so it reads better over a transparent taskbar |
+| `-Ancho 1920 -Alto 1080` | Force a resolution (e.g. your largest monitor) |
+| `-Salida C:\path` | Output folder (default: the script's folder) |
 
-Usá videos propios o que tengas permiso de usar como fondo. Los que hacen bucle sin corte se ven mejor.
+Use videos you made or have permission to use. Seamless loops look best.
 
 <details>
-<summary>Formato del archivo y cómo hacerlo a mano</summary>
+<summary>File format / doing it by hand</summary>
 
-`fondo.hap` es la secuencia de paquetes HAP (DXT1, sin compresión Snappy) que escribe `ffmpeg -f rawvideo`, con la resolución exacta del monitor principal (múltiplos de 4):
+`fondo.hap` is the stream of HAP packets (DXT1, no Snappy) written by `ffmpeg -f rawvideo` (width and height multiples of 4):
 
 ```powershell
 ffmpeg -i video.mp4 -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,fps=30" -pix_fmt rgba -c:v hap -format hap -compressor none -f rawvideo fondo.hap
 ```
 
-Al final, `preparar_video.ps1` agrega 32 bytes: `HAPWALL1` y seis enteros de 32 bits (ancho, alto, fps numerador, fps denominador, cuadros, bytes por cuadro). Si falta ese bloque, el reproductor asume 30 fps.
+`preparar_video.ps1` then appends a 32-byte trailer: `HAPWALL1` followed by six 32-bit integers (width, height, fps numerator, fps denominator, frame count, bytes per frame). Without the trailer the player assumes 30 fps and the primary monitor's resolution.
 </details>
 
-## Compilar
+## Use
 
-Con MSYS2 (UCRT64):
+Put `fondo.hap` (and/or `fondo.mp4`) next to `HapWallpaper.exe` and run it. If both exist, the `.hap` wins.
+
+```
+HapWallpaper.exe [video.mp4 | fondo.hap] [--debug] [--nopause] [--notaskbar] [--noautostart]
+```
+
+| Option | Effect |
+|---|---|
+| `--debug` | Writes `log.txt` (and `tb_log.txt` for the taskbar DLL) next to the `.exe` |
+| `--nopause` | Never pauses for maximized/fullscreen windows |
+| `--notaskbar` | Leaves the taskbar alone (the DLL is not loaded) |
+| `--noautostart` | Doesn't register itself to start with Windows |
+
+To quit: right-click the tray icon → Salir.
+
+### About the taskbar DLL
+
+The transparent taskbar works like [TranslucentTB](https://github.com/TranslucentTB/TranslucentTB): `HapWallpaperTB.dll` is loaded into Explorer through Windows' XAML diagnostics API and sets the taskbar background's opacity to 0. Because it runs inside Explorer, **some antivirus products may flag it**. It's optional: run with `--notaskbar` (or delete the DLL) and nothing is injected. The source is in `hapwallpaper_tb.cpp`.
+
+## Build
+
+With MSYS2 (UCRT64):
 
 ```powershell
 g++ -O2 -s -municode -mwindows -static -o HapWallpaper.exe hapwallpaper.cpp -ld3d11 -ldxgi -lmfplat -lmfuuid -ldwmapi -lshell32 -lwtsapi32 -lole32 -loleaut32 -luuid -luser32 -lgdi32
 g++ -O2 -s -shared -static -municode -o HapWallpaperTB.dll hapwallpaper_tb.cpp -lole32 -loleaut32 -luuid -luser32
 ```
 
-## Uso
+## Credits and license
 
-Dejá `fondo.hap` (y/o `fondo.mp4`) junto a `HapWallpaper.exe` y abrilo. Si están los dos, usa el `.hap`.
+- [HAP](https://hap.video/) — open format created by Tom Butterworth for Vidvox.
+- [ffmpeg](https://ffmpeg.org/) — HAP encoder used by `preparar_video.ps1`.
 
-```
-HapWallpaper.exe [video.mp4 | fondo.hap] [--debug] [--nopause] [--notaskbar] [--noautostart]
-```
-
-| Opción | Efecto |
-|---|---|
-| `--debug` | Escribe `log.txt` junto al `.exe` |
-| `--nopause` | No se pausa con ventanas maximizadas ni pantalla completa |
-| `--notaskbar` | No toca la barra de tareas |
-| `--noautostart` | No se anota en el inicio de Windows |
-
-Para cerrarlo: clic derecho en el ícono de la bandeja → Salir.
-
-## Créditos y licencia
-
-- [HAP](https://hap.video/) — formato abierto creado por Tom Butterworth para Vidvox.
-- [ffmpeg](https://ffmpeg.org/) — codificador HAP usado por `preparar_video.ps1`.
-
-Código bajo licencia [MIT](LICENSE). No incluye videos.
+Code under the [MIT](LICENSE) license. No videos included.
