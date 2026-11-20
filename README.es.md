@@ -17,8 +17,7 @@ HapWallpaper lleva esa ruta al **escritorio de Windows**, en lugar de depender d
 | Decodificación | Decodificador de video de la placa (NVDEC, VCN, Quick Sync) o CPU | **Ninguna**: el cuadro se copia tal cual a una textura BC1 |
 | Conversión de color | YUV → RGB en cada cuadro | No hace falta: BC1 ya es RGB |
 | Monitores G-Sync/FreeSync de alta frecuencia | Un video de 30/60 fps baja la pantalla a 30/60 Hz | Presenta en cada refresco; si el cuadro no cambió vuelve a presentar el mismo buffer (`DXGI_PRESENT_DO_NOT_SEQUENCE`) sin dibujar ni copiar nada, así el monitor sigue a su frecuencia máxima |
-| Ventanas maximizadas o a pantalla completa | Muchos siguen reproduciendo (o se traban al reanudar) | Se pausa **por monitor** al instante; detrás de la barra transparente queda el último cuadro |
-| RAM | StarPaper mide 110–146 MB; los basados en mpv o WebView usan más | **~51 MB reproduciendo, ~1 MB en pausa**: los cuadros se leen del disco de a uno, sin pasar por la caché de archivos |
+| Ventanas maximizadas o a pantalla completa | Varía | Se pausa **por monitor** al instante; detrás de la barra transparente queda el último cuadro |
 | En pausa | Varía | 0 % de GPU |
 
 Medido en una RTX 3060, 2560×1440 a 200 Hz, video de 30 fps:
@@ -33,6 +32,21 @@ Medido en una RTX 3060, 2560×1440 a 200 Hz, video de 30 fps:
 
 La contra: un archivo HAP es grande (~1,8 MB por cuadro a 1440p, ~1 GB para 18 s a 30 fps) en disco, y se lee a ~55 MB/s mientras se reproduce (nada para un SSD; evitá ponerlo en un disco rígido). Si preferís un archivo chico, también reproduce cualquier MP4/AV1 que Windows sepa decodificar, con la misma presentación.
 
+## Medido contra otro programa de fondos
+
+Misma PC (RTX 3060, Ryzen 7 5800X, Windows 11 26H2, un monitor 2560×1440 a 200 Hz), **mismo video a 2560×1440 y 30 fps**, escritorio a la vista, medido con los contadores de GPU de Windows y `nvidia-smi`:
+
+| | **HapWallpaper 1.3.0** | Wallpaper Alive (Steam) |
+|---|---|---|
+| Decodificador de video | **0 %** | 30,5 % |
+| Motor 3D | 1,9 % con la placa en reposo | 1,8 % con la placa a máxima velocidad |
+| Velocidad de la placa al reproducir | **Reposo (P8/P5)** | Máxima (P0, 1567 MHz núcleo / 7501 MHz memoria) |
+| Consumo de la placa (sin fondo: 18 W) | **18,7 W** | 41,1 W |
+| RAM (working set) | **51 MB**, 1 proceso | 552 MB, 5 procesos |
+| CPU | 0,5 % | 0,65 % |
+| Íconos del escritorio | Visibles | Ocultos en esta versión de Windows |
+
+El porcentaje de 3D del Administrador de tareas se calcula sobre la velocidad actual de la placa, así que un porcentaje parecido a máxima velocidad es varias veces más trabajo real que en reposo; el consumo de la placa es la comparación más clara. Una sola PC y un solo video: en otro hardware los resultados pueden variar.
 ## Funciones
 
 - **Todos los monitores**, cada uno con su ventana y su propia pausa. Un mismo archivo HAP llena cualquier resolución y proporción (se escala y recorta al centro en la placa).

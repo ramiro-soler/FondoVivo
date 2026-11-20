@@ -17,8 +17,7 @@ HapWallpaper brings that path to the **Windows desktop**, instead of relying on 
 | Decoding | GPU video decoder (NVDEC, VCN, Quick Sync) or CPU | **None**: the frame is copied as-is into a BC1 texture |
 | Color conversion | YUV → RGB every frame | Not needed: BC1 is already RGB |
 | High-refresh G-Sync / FreeSync monitors | A 30/60 fps video drags the panel down to 30/60 Hz | Presents on every refresh; when the frame didn't change it re-presents the same buffer (`DXGI_PRESENT_DO_NOT_SEQUENCE`) without drawing or copying anything, so the monitor stays at its maximum rate |
-| Maximized or fullscreen windows | Often keeps playing (or stutters on resume) | Pauses **per monitor** instantly; the last frame stays visible behind a transparent taskbar |
-| RAM | StarPaper measures 110–146 MB; mpv/WebView-based apps use more | **~51 MB playing, ~1 MB paused**: frames are streamed from disk one at a time, bypassing the file cache |
+| Maximized or fullscreen windows | Varies | Pauses **per monitor** instantly; the last frame stays visible behind a transparent taskbar |
 | Paused | Varies | 0 % GPU |
 
 Measured on an RTX 3060, 2560×1440 @ 200 Hz, 30 fps video:
@@ -33,6 +32,21 @@ Measured on an RTX 3060, 2560×1440 @ 200 Hz, 30 fps video:
 
 The trade-off: a HAP file is large (~1.8 MB per frame at 1440p, ~1 GB for 18 s at 30 fps) on disk, and it is read at ~55 MB/s while playing (trivial for an SSD; avoid putting it on a hard drive). If you prefer a small file, HapWallpaper also plays any MP4/AV1 Windows can decode, with the same presentation.
 
+## Measured against another wallpaper app
+
+Same PC (RTX 3060, Ryzen 7 5800X, Windows 11 26H2, one 2560×1440 monitor at 200 Hz), **same video at 2560×1440 and 30 fps**, desktop visible, measured with Windows' GPU counters and `nvidia-smi`:
+
+| | **HapWallpaper 1.3.0** | Wallpaper Alive (Steam) |
+|---|---|---|
+| GPU video decoder | **0 %** | 30.5 % |
+| GPU 3D engine | 1.9 % at idle clocks | 1.8 % at maximum clocks |
+| GPU clocks while playing | **Idle (P8/P5)** | Maximum (P0, 1567 MHz core / 7501 MHz memory) |
+| GPU board power (no wallpaper: 18 W) | **18.7 W** | 41.1 W |
+| RAM (working set) | **51 MB**, 1 process | 552 MB, 5 processes |
+| CPU | 0.5 % | 0.65 % |
+| Desktop icons | Visible | Hidden on this Windows build |
+
+Task Manager's 3D percentage is relative to the GPU's current clock speed, so a similar percentage at maximum clocks is several times more real work than at idle clocks; board power is the clearest comparison. One machine, one video: results on other hardware may differ.
 ## Features
 
 - **Every monitor**, each with its own window and its own pause state. One HAP file fills any resolution and aspect ratio (scaled and center-cropped on the GPU).
