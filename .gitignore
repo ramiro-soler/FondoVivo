@@ -1,0 +1,15 @@
+# Videos (pesados y con derechos de sus autores)
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.hap
+
+# Binarios compilados
+*.exe
+*.dll
+*.o
+
+# Registros
+log.txt
+tb_log.txt
