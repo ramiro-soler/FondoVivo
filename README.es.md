@@ -34,7 +34,7 @@ La contra: un archivo HAP es grande (~1,8 MB por cuadro a 1440p, ~1 GB para 18 s
 
 ## Medido contra otro programa de fondos
 
-Misma PC (RTX 3060, Ryzen 7 5800X, Windows 11 26H2, un monitor 2560×1440 a 200 Hz), **mismo video a 2560×1440 y 30 fps**, escritorio a la vista, medido con los contadores de GPU de Windows y `nvidia-smi`:
+Misma PC (RTX 3060, Ryzen 7 5800X, Windows 11, un monitor 2560×1440 a 200 Hz), **mismo video a 2560×1440 y 30 fps**, escritorio a la vista, medido con los contadores de GPU de Windows y `nvidia-smi`:
 
 | | **HapWallpaper 1.3.0** | Wallpaper Alive (Steam) |
 |---|---|---|
