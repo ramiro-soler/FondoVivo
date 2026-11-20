@@ -18,7 +18,8 @@ HapWallpaper lleva esa ruta al **escritorio de Windows**, en lugar de depender d
 | Conversión de color | YUV → RGB en cada cuadro | No hace falta: BC1 ya es RGB |
 | Monitores G-Sync/FreeSync de alta frecuencia | Un video de 30/60 fps baja la pantalla a 30/60 Hz | Presenta en cada refresco; si el cuadro no cambió no dibuja y le pasa a Windows un rectángulo sucio de 1×1, así el monitor sigue a su frecuencia máxima |
 | Ventanas maximizadas o a pantalla completa | Muchos siguen reproduciendo (o se traban al reanudar) | Se pausa **por monitor** al instante; detrás de la barra transparente queda el último cuadro |
-| En pausa | Varía | 0 % de GPU y suelta el archivo de la memoria |
+| RAM | StarPaper mide 110–146 MB; los basados en mpv o WebView usan más | **~51 MB reproduciendo, ~1 MB en pausa**: los cuadros se leen del disco de a uno, sin pasar por la caché de archivos |
+| En pausa | Varía | 0 % de GPU |
 
 Medido en una RTX 3060, 2560×1440 a 200 Hz, video de 30 fps:
 
@@ -27,8 +28,9 @@ Medido en una RTX 3060, 2560×1440 a 200 Hz, video de 30 fps:
 | Decodificador de video | 28–44 % | 6–18 % | **0 %** |
 | CPU | 2,4 % | 0,4 % | 0,5 % |
 | Consumo de la placa (reposo: 18 W) | 22,2 W | 20,7 W | **19,5–20 W** |
+| RAM (working set) | | | **51 MB** (1 MB en pausa) |
 
-La contra: un archivo HAP es grande (~1,8 MB por cuadro a 1440p, ~1 GB para 18 s a 30 fps) y se mapea en memoria mientras se reproduce. Si preferís un archivo chico, también reproduce cualquier MP4/AV1 que Windows sepa decodificar, con la misma presentación.
+La contra: un archivo HAP es grande (~1,8 MB por cuadro a 1440p, ~1 GB para 18 s a 30 fps) en disco, y se lee a ~55 MB/s mientras se reproduce (nada para un SSD; evitá ponerlo en un disco rígido). Si preferís un archivo chico, también reproduce cualquier MP4/AV1 que Windows sepa decodificar, con la misma presentación.
 
 ## Funciones
 

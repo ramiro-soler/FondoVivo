@@ -126,10 +126,18 @@ public:
     }
 };
 
-static void InitD3D() {
+// Media Foundation se carga solo si hace falta reproducir video (en modo HAP no se usa).
+static bool g_mfStarted;
+static void EnsureMF() {
+    if (!g_mfStarted) { MFStartup(MF_VERSION, MFSTARTUP_FULL); g_mfStarted = true; }
+}
+
+// video = true: dispositivo con soporte de video y administrador DXGI para Media Foundation.
+// En modo HAP alcanza con un dispositivo comun (menos memoria del driver).
+static void InitD3D(bool video) {
     if (g_d3d) return;
     D3D_FEATURE_LEVEL fl;
-    UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | (video ? D3D11_CREATE_DEVICE_VIDEO_SUPPORT : 0);
     if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0,
                                  D3D11_SDK_VERSION, &g_d3d, &fl, nullptr))) {
         Log(L"D3D11 sin aceleracion de video; se usa modo por defecto");
@@ -137,11 +145,15 @@ static void InitD3D() {
     }
     ID3D10Multithread* mt = nullptr;
     if (SUCCEEDED(g_d3d->QueryInterface(FV_IID_ID3D10Multithread, (void**)&mt))) { mt->SetMultithreadProtected(TRUE); mt->Release(); }
-    if (SUCCEEDED(MFCreateDXGIDeviceManager(&g_resetToken, &g_dxgiMgr)))
-        g_dxgiMgr->ResetDevice(g_d3d, g_resetToken);
+    if (video) {
+        EnsureMF();
+        if (SUCCEEDED(MFCreateDXGIDeviceManager(&g_resetToken, &g_dxgiMgr)))
+            g_dxgiMgr->ResetDevice(g_d3d, g_resetToken);
+    }
 }
 
 static IMFMediaEngine* CreateEngine(HWND hwnd, bool useDxgi) {
+    EnsureMF();
     IMFMediaEngineClassFactory* factory = nullptr;
     HRESULT hr = CoCreateInstance(FV_CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_INPROC_SERVER,
                                   FV_IID_IMFMediaEngineClassFactory, (void**)&factory);
@@ -180,55 +192,56 @@ struct HapTrailer { char magic[8]; UINT width, height, fpsNum, fpsDen, frames, s
 #pragma pack(pop)
 static const char kHapMagic[8] = { 'H', 'A', 'P', 'W', 'A', 'L', 'L', '1' };
 static std::wstring g_hapPath;
-static HANDLE g_hapFile, g_hapMap;
-static bool g_hapReady; // archivo validado; cada hilo mapea y suelta su propia vista
-static UINT g_hapFrames, g_hapStride, g_hapHdr, g_hapW, g_hapH, g_hapFpsNum = 30, g_hapFpsDen = 1;
+static bool g_hapChecked, g_hapReady; // archivo validado y shaders listos
+static UINT g_hapFrames, g_hapStride, g_hapHdr, g_hapPayload, g_hapW, g_hapH, g_hapFpsNum = 30, g_hapFpsDen = 1;
 static ID3D11VertexShader* g_vs;
 static ID3D11PixelShader* g_ps;
 static ID3D11SamplerState* g_sampler;
 
 typedef HRESULT (WINAPI *PFN_D3DCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
 
-static void CloseHap() {
-    if (g_hapMap) CloseHandle(g_hapMap);
-    if (g_hapFile) CloseHandle(g_hapFile);
-    g_hapMap = g_hapFile = nullptr;
-    g_hapReady = false;
+static bool ReadAt(HANDLE f, LONGLONG off, void* dst, DWORD len) {
+    LARGE_INTEGER li; li.QuadPart = off;
+    DWORD n = 0;
+    return SetFilePointerEx(f, li, nullptr, FILE_BEGIN) && ReadFile(f, dst, len, &n, nullptr) && n == len;
 }
+
+// Valida el archivo leyendo solo el primer encabezado y el bloque final (no lo mapea).
+static bool ValidateHap() {
+    HANDLE f = CreateFileW(g_hapPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size; GetFileSizeEx(f, &size);
+    BYTE p[8] = {};
+    HapTrailer t = {};
+    bool ok = size.QuadPart > 40 && ReadAt(f, 0, p, 8) && ReadAt(f, size.QuadPart - sizeof(t), &t, sizeof(t));
+    CloseHandle(f);
+    ok = ok && (p[3] & 0x0F) == 0x0B && (p[3] & 0xF0) == 0xA0; // DXT1, sin Snappy
+    if (!ok) return false;
+    UINT s24 = p[0] | (p[1] << 8) | (p[2] << 16);
+    g_hapHdr = s24 ? 4 : 8;
+    g_hapPayload = s24 ? s24 : *(const UINT*)(p + 4);
+    g_hapStride = g_hapHdr + g_hapPayload;
+    LONGLONG data = size.QuadPart;
+    if (!memcmp(t.magic, kHapMagic, 8)) {
+        data -= sizeof(t);
+        g_hapW = t.width; g_hapH = t.height;
+        g_hapFpsNum = t.fpsNum; g_hapFpsDen = t.fpsDen;
+        ok = t.fpsNum && t.fpsDen && t.stride == g_hapStride && (LONGLONG)t.frames * t.stride == data;
+    } else {
+        // Archivo sin bloque final: se asume la resolucion del monitor principal.
+        g_hapW = GetSystemMetrics(SM_CXSCREEN); g_hapH = GetSystemMetrics(SM_CYSCREEN);
+        g_hapFpsNum = 30; g_hapFpsDen = 1;
+    }
+    ok = ok && g_hapW % 4 == 0 && g_hapH % 4 == 0 && g_hapPayload == g_hapW * g_hapH / 2 && data % g_hapStride == 0;
+    g_hapFrames = ok ? (UINT)(data / g_hapStride) : 0;
+    return ok && g_hapFrames;
+}
+
+static void CloseHap() { g_hapReady = false; }
 
 static bool InitHap() {
     if (g_hapReady) return true;
-    if (g_hapPath.empty() || !g_d3d) return false;
-    g_hapFile = CreateFileW(g_hapPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (g_hapFile == INVALID_HANDLE_VALUE) { g_hapFile = nullptr; return false; }
-    LARGE_INTEGER size; GetFileSizeEx(g_hapFile, &size);
-    g_hapMap = CreateFileMappingW(g_hapFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    // Vista temporal solo para validar; se suelta antes de reproducir.
-    const BYTE* p = g_hapMap ? (const BYTE*)MapViewOfFile(g_hapMap, FILE_MAP_READ, 0, 0, 0) : nullptr;
-    bool ok = p && size.QuadPart > 40 && (p[3] & 0x0F) == 0x0B && (p[3] & 0xF0) == 0xA0; // DXT1, sin Snappy
-    if (ok) {
-        UINT s24 = p[0] | (p[1] << 8) | (p[2] << 16);
-        g_hapHdr = s24 ? 4 : 8;
-        UINT payload = s24 ? s24 : *(const UINT*)(p + 4);
-        LONGLONG data = size.QuadPart;
-        const HapTrailer* t = (const HapTrailer*)(p + size.QuadPart - sizeof(HapTrailer));
-        if (!memcmp(t->magic, kHapMagic, 8)) {
-            data -= sizeof(HapTrailer);
-            g_hapW = t->width; g_hapH = t->height;
-            g_hapFpsNum = t->fpsNum; g_hapFpsDen = t->fpsDen;
-            ok = t->fpsNum && t->fpsDen && t->stride == g_hapHdr + payload && (LONGLONG)t->frames * t->stride == data;
-        } else {
-            // Archivo sin bloque final: se asume la resolucion del monitor principal.
-            g_hapW = GetSystemMetrics(SM_CXSCREEN); g_hapH = GetSystemMetrics(SM_CYSCREEN);
-            g_hapFpsNum = 30; g_hapFpsDen = 1;
-        }
-        g_hapStride = g_hapHdr + payload;
-        ok = ok && g_hapW % 4 == 0 && g_hapH % 4 == 0 && payload == g_hapW * g_hapH / 2 && data % g_hapStride == 0;
-        g_hapFrames = ok ? (UINT)(data / g_hapStride) : 0;
-    }
-    if (p) UnmapViewOfFile(p);
-    if (!ok || !g_hapFrames) { Log(L"Archivo HAP invalido: %ls", g_hapPath.c_str()); CloseHap(); return false; }
-
+    if (g_hapPath.empty() || !g_d3d || !g_hapFrames) return false;
     HRESULT hr = S_OK;
     if (!g_vs) {
         // El triangulo cubre la pantalla; uv recorta el video para llenarla (cb).
@@ -298,23 +311,62 @@ static DWORD WINAPI RenderThread(LPVOID param) {
     LARGE_INTEGER qpf; QueryPerformanceFrequency(&qpf);
     LONGLONG hapLast = 0, hapAcc = 0;
     UINT hapCur = ~0u;
-    const BYTE* hapView = nullptr;      // vista propia del archivo; se suelta al pausar
+    // Lectura de cuadros: el archivo HAP no se carga en memoria. Se lee del disco solo el
+    // cuadro que toca (~1,8 MB a 1440p), sin la cache de Windows (FILE_FLAG_NO_BUFFERING),
+    // en dos buffers: mientras se muestra uno, el siguiente cuadro ya se esta leyendo.
+    const DWORD kSector = 4096;
+    HANDLE hf = INVALID_HANDLE_VALUE;
+    BYTE* buf[2] = {};
+    OVERLAPPED ov[2] = {};
+    bool pending[2] = {};
+    UINT bufFrame[2] = { ~0u, ~0u }, delta[2] = {};
+    DWORD bufSize = (DWORD)(((ULONGLONG)g_hapPayload + 2 * kSector + kSector - 1) & ~(ULONGLONG)(kSector - 1));
+    auto finish = [&](int b) -> bool {
+        if (!pending[b]) return false;
+        pending[b] = false;
+        DWORD n = 0;
+        return GetOverlappedResult(hf, &ov[b], &n, TRUE) && n >= delta[b] + g_hapPayload;
+    };
+    auto issue = [&](int b, UINT f) {
+        ULONGLONG off = (ULONGLONG)f * g_hapStride + g_hapHdr;
+        ULONGLONG start = off & ~(ULONGLONG)(kSector - 1);
+        DWORD len = (DWORD)((off + g_hapPayload - start + kSector - 1) & ~(ULONGLONG)(kSector - 1));
+        ov[b].Offset = (DWORD)start; ov[b].OffsetHigh = (DWORD)(start >> 32);
+        ResetEvent(ov[b].hEvent);
+        delta[b] = (UINT)(off - start); bufFrame[b] = f;
+        pending[b] = ReadFile(hf, buf[b], len, nullptr, &ov[b]) || GetLastError() == ERROR_IO_PENDING;
+        if (!pending[b]) bufFrame[b] = ~0u;
+    };
+    auto releaseHap = [&]() {
+        for (int b = 0; b < 2; b++) {
+            if (pending[b]) finish(b);
+            if (buf[b]) { VirtualFree(buf[b], 0, MEM_RELEASE); buf[b] = nullptr; }
+            if (ov[b].hEvent) { CloseHandle(ov[b].hEvent); ov[b].hEvent = nullptr; }
+            bufFrame[b] = ~0u;
+        }
+        if (hf != INVALID_HANDLE_VALUE) { CloseHandle(hf); hf = INVALID_HANDLE_VALUE; }
+    };
     MFVideoNormalizedRect src = { 0, 0, 1, 1 };
     bool srcReady = false;
     while (!s->stop) {
         if (WaitForSingleObject(s->runEvent, 0) == WAIT_TIMEOUT) {
-            // En pausa: soltar la vista del archivo HAP (~1 GB) hasta que vuelva a reproducirse.
-            if (hapView) {
-                UnmapViewOfFile(hapView); hapView = nullptr;
+            // En pausa: soltar el archivo y los buffers hasta que vuelva a reproducirse.
+            if (hf != INVALID_HANDLE_VALUE) {
+                releaseHap();
                 SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
             }
             hapLast = 0;
             WaitForSingleObject(s->runEvent, INFINITE);
         }
         if (s->stop) break;
-        if (hap && !hapView) {
-            hapView = (const BYTE*)MapViewOfFile(g_hapMap, FILE_MAP_READ, 0, 0, 0);
-            if (!hapView) { Sleep(100); continue; }
+        if (hap && hf == INVALID_HANDLE_VALUE) {
+            hf = CreateFileW(g_hapPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+            for (int b = 0; b < 2 && hf != INVALID_HANDLE_VALUE; b++) {
+                buf[b] = (BYTE*)VirtualAlloc(nullptr, bufSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                ov[b].hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            }
+            if (hf == INVALID_HANDLE_VALUE || !buf[0] || !buf[1]) { releaseHap(); Sleep(500); continue; }
         }
         // Espera el proximo refresco (la cola del swap chain tiene lugar).
         if (waitNext && WaitForSingleObject(s->frameWait, 100) != WAIT_OBJECT_0) { waitNext = false; continue; }
@@ -326,10 +378,24 @@ static DWORD WINAPI RenderThread(LPVOID param) {
             hapLast = now.QuadPart;
             UINT f = (UINT)((hapAcc * (LONGLONG)g_hapFpsNum / (qpf.QuadPart * (LONGLONG)g_hapFpsDen)) % g_hapFrames);
             if (f != hapCur) {
-                EnterCriticalSection(&g_ctxLock);
-                ctx->UpdateSubresource(s->hapTex, 0, nullptr, hapView + (size_t)f * g_hapStride + g_hapHdr, (g_hapW / 4) * 8, 0);
-                LeaveCriticalSection(&g_ctxLock);
-                hapCur = f; frameVer++; haveFrame = true;
+                int b = bufFrame[0] == f ? 0 : bufFrame[1] == f ? 1 : -1;
+                if (b < 0) { // no estaba adelantado (inicio o despues de una pausa)
+                    b = 0;
+                    if (pending[1]) finish(1);
+                    if (pending[0]) finish(0);
+                    issue(0, f);
+                }
+                if (finish(b)) {
+                    EnterCriticalSection(&g_ctxLock);
+                    ctx->UpdateSubresource(s->hapTex, 0, nullptr, buf[b] + delta[b], (g_hapW / 4) * 8, 0);
+                    LeaveCriticalSection(&g_ctxLock);
+                    hapCur = f; frameVer++; haveFrame = true;
+                }
+                bufFrame[b] = ~0u;
+                // Adelantar la lectura del cuadro siguiente en el otro buffer.
+                int nb = b ^ 1;
+                if (pending[nb]) finish(nb);
+                issue(nb, (f + 1) % g_hapFrames);
             }
         } else {
             if (!srcReady) {
@@ -391,7 +457,7 @@ static DWORD WINAPI RenderThread(LPVOID param) {
         if (SUCCEEDED(s->swap->Present1(1, 0, &pp))) { waitNext = true; s->shown = true; }
         else Sleep(5);
     }
-    if (hapView) UnmapViewOfFile(hapView);
+    releaseHap();
     if (sc3) sc3->Release();
     ctx->Release();
     return 0;
@@ -516,7 +582,11 @@ static void Attach() {
     DestroyScreens();
     HWND worker = FindWorkerW();
     if (!worker) { Log(L"No se encontro WorkerW"); return; }
-    InitD3D();
+    if (!g_hapChecked) {
+        g_hapChecked = true;
+        if (!g_hapPath.empty() && !ValidateHap()) { g_hapFrames = 0; Log(L"Archivo HAP invalido: %ls", g_hapPath.c_str()); }
+    }
+    InitD3D(g_hapFrames == 0); // con HAP valido no hace falta soporte de video ni Media Foundation
     if (!g_hapPath.empty() && !InitHap() && !g_hapWarned) {
         g_hapWarned = true;
         bool mp4 = GetFileAttributesW(g_videoPath.c_str()) != INVALID_FILE_ATTRIBUTES;
@@ -815,7 +885,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    MFStartup(MF_VERSION, MFSTARTUP_FULL);
 
     WNDCLASSW wc = {};
     wc.hInstance = inst;
@@ -851,7 +920,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (g_ps) g_ps->Release();
     if (g_dxgiMgr) g_dxgiMgr->Release();
     if (g_d3d) g_d3d->Release();
-    MFShutdown();
+    if (g_mfStarted) MFShutdown();
     CoUninitialize();
     if (debugEvent) CloseHandle(debugEvent);
     if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
